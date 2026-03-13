@@ -1,6 +1,6 @@
 # Rope API Reference
 
-Full reference for python-rope (v1.14.0). Use this to expand the rope-refactor skill with new capabilities.
+Full reference for python-rope (v1.14.0). Use this to expand the python-refactor skill with new capabilities.
 
 Source: context7 docs + installed source at `.venv/lib/python*/site-packages/rope/`.
 

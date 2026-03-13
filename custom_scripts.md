@@ -27,7 +27,7 @@ if __name__ == "__main__":
     run(refactor, description="My refactor script", setup_args=setup_args)
 ```
 
-**IMPORTANT:** The `sys.path.insert` line MUST use the absolute path to this skill's `scripts/` directory so `rope_bootstrap` and other skill modules can be imported. Use the actual resolved path, e.g. `/Users/me/.claude/skills/rope-refactor/scripts`.
+**IMPORTANT:** The `sys.path.insert` line MUST use the absolute path to this skill's `scripts/` directory so `rope_bootstrap` and other skill modules can be imported. Use the actual resolved path, e.g. `/Users/me/.claude/skills/python-refactor/scripts`.
 
 ## Bootstrap CLI flags
 

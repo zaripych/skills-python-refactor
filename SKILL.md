@@ -1,9 +1,9 @@
 ---
-name: rope-refactor
-description: Perform AST-aware Python refactors using the rope library. Handles parameter annotations, import management, rename, move, and custom source transformations with precise byte-offset edits. Triggers: "add type annotations", "refactor with rope", "rope refactor skill", "rope refactor tool", "add imports", "rename across files", "annotate parameters", or needs AST-aware Python source code transformation.
+name: python-refactor
+description: Perform AST-aware Python refactors using the rope library. Handles parameter annotations, import management, rename, move, and custom source transformations with precise byte-offset edits. Triggers: "add type annotations", "refactor with rope", "python refactor skill", "python refactor tool", "add imports", "rename across files", "annotate parameters", or needs AST-aware Python source code transformation.
 ---
 
-# Rope Refactor
+# Python Refactor
 
 Use python-rope for AST-aware Python refactoring. Rope provides precise byte-offset editing, import management, and cross-file rename/move — safer than regex for source code transformation.
 
@@ -64,8 +64,6 @@ See [rope-api.md](rope-api.md) for full usage details.
 ## Adding type annotations to parameters
 
 **Prefer reusing `add_param_annotations`** over writing new scripts. The factory handles rg pre-filtering, AST walking, import insertion, and byte-offset annotation in one call.
-
-All scripts MUST use the bootstrap. See [custom_scripts.md](custom_scripts.md) — MANDATORY when writing any refactor script.
 
 ```python
 import sys
@@ -143,6 +141,10 @@ Parameters:
 Rope handles deduplication — the import won't be added if already present.
 
 See [imports.md](imports.md) — MANDATORY when writing custom import logic.
+
+## Custom refactoring scripts
+
+If none of the existing solutions fit, a custom refactor script can be created. All scripts MUST use the bootstrap though. See [custom_scripts.md](custom_scripts.md) — MANDATORY when writing any refactor script.
 
 ## File selection
 
