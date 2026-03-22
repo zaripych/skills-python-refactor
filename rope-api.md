@@ -174,13 +174,34 @@ changes = Rename(project, resource, offset).get_changes("new_name")
 project.do(changes)
 ```
 
-### Move
+### Move (MoveGlobal)
 
 ```python
 from rope.refactor.move import create_move
 
 mover = create_move(project, resource, offset)
+
+# dest can be a Resource object or a dotted module name string
 changes = mover.get_changes(dest=destination_resource)
+changes = mover.get_changes(dest="pkg.subpkg.module")
+project.do(changes)
+```
+
+**Prerequisites for MoveGlobal:**
+
+1. **ModuleToPackage first** — if the source module needs to become a package (e.g. moving `fn` from `crypto.py` into `crypto/config.py`), run `ModuleToPackage` before `MoveGlobal`. You can't have both `crypto.py` and `crypto/` coexisting.
+
+2. **`__init__.py` in intermediate directories** — rope can't resolve dotted module paths through implicit namespace packages. Without `__init__.py`, `MoveGlobal` silently falls back to a bare `import name` with no package path. Create empty `__init__.py` files before running `MoveGlobal`; they can be removed afterward if implicit namespace packages are desired at runtime.
+
+### ModuleToPackage
+
+Converts a single-file module into a package: `crypto.py` → `crypto/__init__.py`. Creates the directory, moves the file, and rewrites relative imports to absolute. All callers continue working unchanged.
+
+```python
+from rope.refactor.topackage import ModuleToPackage
+
+resource = project.get_resource("src/crypto.py")
+changes = ModuleToPackage(project, resource).get_changes()
 project.do(changes)
 ```
 
@@ -251,7 +272,6 @@ project.do(changes)
 - `rope.refactor.introduce_factory` — Create factory for class
 - `rope.refactor.encapsulate_field` — Generate getters/setters
 - `rope.refactor.localtofield` — Promote local to instance field
-- `rope.refactor.topackage` — Convert module to package
 
 ## Change System
 
@@ -311,6 +331,13 @@ autoimport.aliases = [
     ["dt", "datetime"],
     ["np", "numpy"],
 ]
+
+[tool.rope.imports]
+# Controls how MoveGlobal rewrites imports in callers.
+# "normal-import" (default) → import pkg.mod         → pkg.mod.func()
+# "from-module"             → from pkg import mod     → mod.func()
+# "from-global"             → from pkg.mod import func → func()
+preferred_import_style = "from-global"
 ```
 
 Or via `.ropeproject/config.py` (legacy).

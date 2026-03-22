@@ -46,20 +46,7 @@ Each refactor script adds its own args via `setup_args`. Access all parsed args 
 
 ### File selection
 
-```python
-# All .py files in directory (no text filter)
-files = ctx.find_files(directory)
-
-# Only files containing "cmd" or "send", filtered by globs
-files = ctx.find_files(
-    directory,
-    patterns={"cmd", "send"},
-    include=["tests/**/*.py"],
-    exclude=["conftest.py"],
-)
-```
-
-When `patterns` is provided, files are pre-filtered with ripgrep (falling back to grep), then intersected with include/exclude globs. Without `patterns`, only glob filtering is applied.
+Use `ctx.find_files()` for file selection — see SKILL.md for usage and parameters.
 
 ### Reading and writing
 
