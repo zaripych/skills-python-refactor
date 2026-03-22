@@ -5,7 +5,6 @@ Provides helpers to create temporary rope projects and assert on generated patch
 
 from __future__ import annotations
 
-import difflib
 import sys
 from argparse import Namespace
 from dataclasses import dataclass
@@ -15,7 +14,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from rope.base.project import Project
-from rope_bootstrap import RefactorContext
+from rope_bootstrap import RefactorContext, _format_diff
 
 
 @dataclass
@@ -46,13 +45,4 @@ def create_project(tmp_path: Path) -> RopeTestProject:
 
 def get_diffs(ctx: RefactorContext) -> list[str]:
     """Return unified diffs for all pending writes."""
-    diffs: list[str] = []
-    for pw in ctx._pending:
-        path = pw.resource.path
-        original_lines = pw.original.splitlines(keepends=True)
-        new_lines = pw.new_source.splitlines(keepends=True)
-        diff = "".join(
-            difflib.unified_diff(original_lines, new_lines, f"a/{path}", f"b/{path}")
-        )
-        diffs.append(diff)
-    return diffs
+    return [_format_diff(pw) for pw in ctx._pending]

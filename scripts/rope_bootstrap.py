@@ -23,6 +23,7 @@ Usage in refactor scripts:
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -32,7 +33,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
-from rope.base.change import Change, ChangeContents, ChangeSet
+from rope.base.change import Change, ChangeContents, ChangeSet, MoveResource
 from rope.base.fscommands import FileSystemCommands, FileContent, unicode_to_file_data
 from rope.base.project import Project
 from rope.base.resources import File
@@ -59,6 +60,8 @@ class OverlayFSCommands:
     def __init__(self, real: FileSystemCommands) -> None:
         self._real = real
         self._overlay: dict[str, FileContent] = {}
+        self._folders: set[str] = set()
+        self._removals: set[str] = set()
 
     def read(self, path: str) -> FileContent:
         if path in self._overlay:
@@ -72,22 +75,35 @@ class OverlayFSCommands:
         self._overlay[path] = FileContent(b"")
 
     def create_folder(self, path: str) -> None:
-        self._real.create_folder(path)
+        self._folders.add(path)
+
+    def _ensure_folders(self) -> None:
+        """Create pending folders on disk during commit."""
+        for path in sorted(self._folders):
+            self._real.create_folder(path)
+        self._folders.clear()
 
     def move(self, path: str, new_location: str) -> None:
         if path in self._overlay:
             self._overlay[new_location] = self._overlay.pop(path)
         else:
             self._overlay[new_location] = self._real.read(path)
+        self._removals.add(path)
 
     def remove(self, path: str) -> None:
         self._overlay.pop(path, None)
+        self._removals.add(path)
 
     def commit(self) -> None:
         """Flush all in-memory changes to disk."""
+        self._ensure_folders()
         for path, data in self._overlay.items():
             self._real.write(path, data)
         self._overlay.clear()
+        for path in self._removals:
+            if os.path.exists(path):
+                self._real.remove(path)
+        self._removals.clear()
 
 
 @dataclass
@@ -95,6 +111,14 @@ class PendingWrite:
     resource: File
     original: str
     new_source: str
+    new_path: str | None = None
+
+
+@dataclass
+class PendingOp:
+    """A non-content change (move, create, remove)."""
+
+    description: str
 
 
 @dataclass
@@ -109,6 +133,7 @@ class RefactorContext:
     _stack: ChangeStack = field(init=False)
     _fs: OverlayFSCommands = field(init=False)
     _pending: list[PendingWrite] = field(default_factory=list)
+    _ops: list[PendingOp] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self._fs = OverlayFSCommands(self.project.fscommands)
@@ -210,13 +235,27 @@ class RefactorContext:
     def do(self, changes: Change) -> None:
         """Apply a rope Change (e.g. from Rename, Move, Extract).
         Captures ChangeContents into _pending for diff/backup tracking,
-        then pushes onto the ChangeStack so reads see the result."""
-        for change in self._iter_changes(changes):
+        and non-content changes into _ops for display.
+        Then pushes onto the ChangeStack so reads see the result."""
+        leaves = self._iter_changes(changes)
+        # Collect moves so we can annotate content changes with new paths
+        moves: dict[str, str] = {}
+        for change in leaves:
+            if isinstance(change, MoveResource):
+                moves[change.resource.path] = change.new_resource.path
+        for change in leaves:
             if isinstance(change, ChangeContents):
                 original = change.resource.read()
                 self._pending.append(
-                    PendingWrite(change.resource, original, change.new_contents)
+                    PendingWrite(
+                        change.resource,
+                        original,
+                        change.new_contents,
+                        new_path=moves.get(change.resource.path),
+                    )
                 )
+            else:
+                self._ops.append(PendingOp(change.get_description()))
         self._stack.push(changes)
 
     def _iter_changes(self, changes: Change) -> list[Change]:
@@ -316,18 +355,19 @@ def run(
         project.close()
         raise
 
-    if not ctx._pending:
+    if not ctx._pending and not ctx._ops:
         print("No changes needed.")
         project.close()
         return
 
     if dry_run:
-        print(
-            f"{'[dry-run] ' if not show_diff else ''}Would modify {len(ctx._pending)} file(s):"
-        )
+        total = len(ctx._pending) + len(ctx._ops)
+        print(f"{'[dry-run] ' if not show_diff else ''}Would apply {total} change(s):")
+        for op in ctx._ops:
+            print(op.description)
         for pw in ctx._pending:
             if show_diff:
-                _print_diff(pw)
+                sys.stdout.write(_format_diff(pw))
             else:
                 print(f"  {pw.resource.path}")
     else:
@@ -336,7 +376,10 @@ def run(
                 bak_path = Path(project_root) / (pw.resource.path + ".bak")
                 bak_path.write_text(pw.original)
         ctx.commit()
-        print(f"Updated {len(ctx._pending)} file(s):")
+        total = len(ctx._pending) + len(ctx._ops)
+        print(f"Applied {total} change(s):")
+        for op in ctx._ops:
+            print(op.description)
         for pw in ctx._pending:
             suffix = " (.bak created)" if args.backup else ""
             print(f"  {pw.resource.path}{suffix}")
@@ -344,12 +387,44 @@ def run(
     project.close()
 
 
-def _print_diff(pw: PendingWrite) -> None:
-    """Print a unified diff for a pending write."""
+def _format_diff(pw: PendingWrite) -> str:
+    """Return a unified diff string with line numbers for a pending write."""
     import difflib
+    import re
 
-    path = pw.resource.path
+    old_path = pw.resource.path
+    new_path = pw.new_path or old_path
     original_lines = pw.original.splitlines(keepends=True)
     new_lines = pw.new_source.splitlines(keepends=True)
-    diff = difflib.unified_diff(original_lines, new_lines, f"a/{path}", f"b/{path}")
-    sys.stdout.writelines(diff)
+    raw = difflib.unified_diff(
+        original_lines, new_lines, f"a/{old_path}", f"b/{new_path}"
+    )
+
+    out: list[str] = []
+    old_ln = new_ln = 0
+    # Determine width needed for line numbers
+    max_ln = max(len(original_lines), len(new_lines))
+    w = max(len(str(max_ln)), 1)
+    blank = " " * w
+    for line in raw:
+        if line.startswith("@@"):
+            m = re.match(r"@@ -(\d+)", line)
+            if m:
+                old_ln = int(m.group(1))
+            m2 = re.match(r"@@ -\d+(?:,\d+)? \+(\d+)", line)
+            if m2:
+                new_ln = int(m2.group(1))
+            out.append(line)
+        elif line.startswith("---") or line.startswith("+++"):
+            out.append(line)
+        elif line.startswith("-"):
+            out.append(f"{old_ln:>{w}}\u2192 {line}")
+            old_ln += 1
+        elif line.startswith("+"):
+            out.append(f"{new_ln:>{w}}\u2192 {line}")
+            new_ln += 1
+        else:
+            out.append(f"{old_ln:>{w}}\u2192 {line}")
+            old_ln += 1
+            new_ln += 1
+    return "".join(out)
