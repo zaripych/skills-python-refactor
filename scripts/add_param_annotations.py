@@ -27,9 +27,9 @@ from __future__ import annotations
 
 import ast
 import sys
-from argparse import ArgumentParser
 from pathlib import Path
 
+from rope.base.change import ChangeContents, ChangeSet
 from rope.base.codeanalyze import ChangeCollector
 from rope.refactor.importutils.importinfo import FromImport, NormalImport
 from rope.refactor.importutils.module_imports import ModuleImports
@@ -46,8 +46,6 @@ def add_param_annotations(
 ) -> RefactorFn:
     """Return a refactor function that annotates parameters matching `annotations`.
 
-    Expects `ctx.args.directory` to be a Path to scan for .py files.
-
     Args:
         annotations: Mapping of parameter names to annotation strings.
         imports: Optional mapping of parameter names to rope import objects.
@@ -61,11 +59,8 @@ def add_param_annotations(
 
     def refactor(ctx: RefactorContext) -> None:
         param_names = set(annotations)
-        directory = ctx.args.directory
 
-        files = ctx.find_files(
-            directory, patterns=param_names, include=_include, exclude=_exclude
-        )
+        files = ctx.find_files(patterns=param_names, include=_include, exclude=_exclude)
 
         for file_path in files:
             resource = ctx.get_resource(file_path)
@@ -114,13 +109,11 @@ def add_param_annotations(
 
             final_source = collector.get_changed()
             if final_source:
-                ctx.write(resource, final_source)
+                cs = ChangeSet(f"Change <{resource.path}>")
+                cs.add_change(ChangeContents(resource, final_source))
+                ctx.do(cs)
 
     return refactor
-
-
-def setup_args(parser: ArgumentParser) -> None:
-    parser.add_argument("directory", type=Path, help="Directory to scan for .py files")
 
 
 if __name__ == "__main__":

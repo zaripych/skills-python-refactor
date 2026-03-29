@@ -1,0 +1,13 @@
+[project]
+name = "fixture-idiomatic-layout"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.rope.imports]
+preferred_import_style = "from-global"
+
+[tool.ty.environment]
+python-version = "3.14"
+root = ["src"]
+extra-paths = ["tests"]

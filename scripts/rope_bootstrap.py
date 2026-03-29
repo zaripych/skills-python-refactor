@@ -1,21 +1,24 @@
 """Bootstrap for rope refactor scripts.
 
-Handles project setup, dry-run mode, git safety checks, and diff output.
+Handles project setup, dry-run mode, and diff output.
 Every refactor script imports this and calls `run()` with a refactor function.
 
 Usage in refactor scripts:
 
     from rope_bootstrap import run, RefactorContext
+    from rope.refactor.rename import Rename
 
     def setup_args(parser):
-        parser.add_argument("directory", type=Path, help="Directory to scan")
+        parser.add_argument("source", type=Path, help="Source file")
 
     def refactor(ctx: RefactorContext) -> None:
-        for f in sorted(ctx.args.directory.rglob("*.py")):
-            resource = ctx.get_resource(f)
-            source = resource.read()
-            # ... compute new_source ...
-            ctx.write(resource, new_source)
+        resource = ctx.get_resource(ctx.args.source)
+        pymodule = ctx.project.get_pymodule(resource)
+        source = resource.read()
+        line_start = pymodule.lines.get_line_start(line_number)
+        offset = line_start + source[line_start:].index("symbol_name")
+        changes = Rename(ctx.project, resource, offset).get_changes("new_name")
+        ctx.do(changes)
 
     if __name__ == "__main__":
         run(refactor, description="My refactor script", setup_args=setup_args)
@@ -23,6 +26,7 @@ Usage in refactor scripts:
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import subprocess
@@ -34,10 +38,12 @@ from pathlib import Path
 from typing import Protocol
 
 from rope.base.change import Change, ChangeContents, ChangeSet, MoveResource
-from rope.base.fscommands import FileSystemCommands, FileContent, unicode_to_file_data
 from rope.base.project import Project
 from rope.base.resources import File
-from rope.contrib.changestack import ChangeStack
+
+# Prefix used to tag ChangeSet descriptions with a refactor run hash.
+# Format: [refactor:<8-char-hex>] <original description>
+REFACTOR_TAG_PREFIX = "[refactor:"
 
 
 class SetupArgsFn(Protocol):
@@ -47,106 +53,233 @@ class SetupArgsFn(Protocol):
 
 
 class RefactorFn(Protocol):
-    """Refactor callback. Use ctx.write() to queue changes — never call
-    resource.write() directly, as that bypasses dry-run, diff, and backup."""
+    """Refactor callback. Use ctx.do() to apply changes — never call
+    resource.write() directly, as that bypasses diff tracking and undo."""
 
     def __call__(self, ctx: RefactorContext) -> None: ...
 
 
-class OverlayFSCommands:
-    """Wraps real fscommands, redirecting writes to an in-memory overlay.
-    Reads check the overlay first, falling back to disk."""
+@dataclass
+class FileDiff:
+    """A recorded content change for diff display."""
 
-    def __init__(self, real: FileSystemCommands) -> None:
-        self._real = real
-        self._overlay: dict[str, FileContent] = {}
-        self._folders: set[str] = set()
-        self._removals: set[str] = set()
-
-    def read(self, path: str) -> FileContent:
-        if path in self._overlay:
-            return self._overlay[path]
-        return self._real.read(path)
-
-    def write(self, path: str, data: FileContent) -> None:
-        self._overlay[path] = data
-
-    def create_file(self, path: str) -> None:
-        self._overlay[path] = FileContent(b"")
-
-    def create_folder(self, path: str) -> None:
-        self._folders.add(path)
-
-    def _ensure_folders(self) -> None:
-        """Create pending folders on disk during commit."""
-        for path in sorted(self._folders):
-            self._real.create_folder(path)
-        self._folders.clear()
-
-    def move(self, path: str, new_location: str) -> None:
-        if path in self._overlay:
-            self._overlay[new_location] = self._overlay.pop(path)
-        else:
-            self._overlay[new_location] = self._real.read(path)
-        self._removals.add(path)
-
-    def remove(self, path: str) -> None:
-        self._overlay.pop(path, None)
-        self._removals.add(path)
-
-    def commit(self) -> None:
-        """Flush all in-memory changes to disk."""
-        self._ensure_folders()
-        for path, data in self._overlay.items():
-            self._real.write(path, data)
-        self._overlay.clear()
-        for path in self._removals:
-            if os.path.exists(path):
-                self._real.remove(path)
-        self._removals.clear()
+    path: str
+    original: str | None  # None for new files
+    new_source: str | None  # None for removals
+    new_path: str | None = None  # set if file was moved/renamed
+    step: int = 0  # which ctx.do() call produced this diff
 
 
 @dataclass
-class PendingWrite:
-    resource: File
-    original: str
-    new_source: str
-    new_path: str | None = None
+class GitSnapshot:
+    """Captures git working tree state for undo verification."""
+
+    _tree: str | None
+    _cwd: Path
+
+    @classmethod
+    def capture(cls, cwd: Path) -> GitSnapshot:
+        """Snapshot current state: staged, unstaged, and untracked files."""
+        tree = cls._capture_tree(cwd)
+        return cls(_tree=tree, _cwd=cwd)
+
+    @classmethod
+    def unavailable(cls, cwd: Path) -> GitSnapshot:
+        """Return a no-op snapshot when not in a git repo."""
+        return cls(_tree=None, _cwd=cwd)
+
+    @staticmethod
+    def _capture_tree(cwd: Path) -> str | None:
+        """Create a stash commit and return its tree hash (timestamp-independent)."""
+        stash = subprocess.run(
+            ["git", "stash", "create", "--include-untracked"],
+            capture_output=True,
+            text=True,
+            cwd=cwd,
+        )
+        commit_sha = stash.stdout.strip()
+        if not commit_sha:
+            return None
+        tree = subprocess.run(
+            ["git", "rev-parse", f"{commit_sha}^{{tree}}"],
+            capture_output=True,
+            text=True,
+            cwd=cwd,
+        )
+        return tree.stdout.strip() or None
+
+    def verify(self) -> list[str]:
+        """Compare current state to snapshot. Returns difference descriptions.
+        Empty list means undo was perfect."""
+        if self._tree is None:
+            # No git or clean tree at capture time — nothing to compare against
+            return []
+
+        current_tree = self._capture_tree(self._cwd)
+
+        if self._tree == current_tree:
+            return []
+
+        if current_tree is None:
+            # Tree is now clean but wasn't at capture — that's unexpected after undo
+            return [f"Working tree is clean but snapshot tree {self._tree[:8]} existed"]
+
+        result = subprocess.run(
+            ["git", "diff", self._tree, current_tree, "--stat"],
+            capture_output=True,
+            text=True,
+            cwd=self._cwd,
+        )
+        if result.stdout.strip():
+            return result.stdout.strip().splitlines()
+        return []
 
 
-@dataclass
-class PendingOp:
-    """A non-content change (move, create, remove)."""
+def _compute_state_hash(project_root: Path) -> str:
+    """Compute a hash identifying the current codebase state.
 
-    description: str
+    Combines git HEAD and git status to produce an 8-char hex prefix.
+    This tags ChangeSets so undo/redo scripts can identify all changes
+    from a single refactor run.
+
+    Returns an empty string if not in a git repo.
+    """
+    git_root = _git_repo_root(project_root)
+    if git_root is None:
+        return ""
+
+    h = hashlib.sha256()
+
+    # Git HEAD (identifies the codebase version)
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        cwd=git_root,
+    )
+    h.update(head.stdout.strip().encode())
+
+    # Git status (identifies uncommitted state)
+    status = subprocess.run(
+        ["git", "status", "--porcelain"],
+        capture_output=True,
+        text=True,
+        cwd=git_root,
+    )
+    h.update(status.stdout.encode())
+
+    return h.hexdigest()[:8]
 
 
 @dataclass
 class RefactorContext:
-    """Passed to refactor functions. Uses ChangeStack with an in-memory
-    filesystem overlay so writes are visible to subsequent reads without
-    touching disk until commit()."""
+    """Passed to refactor functions. All changes are applied to disk
+    immediately via project.do() and can be undone via undo_all()."""
 
     project: Project
     args: Namespace
     dry_run: bool
-    _stack: ChangeStack = field(init=False)
-    _fs: OverlayFSCommands = field(init=False)
-    _pending: list[PendingWrite] = field(default_factory=list)
-    _ops: list[PendingOp] = field(default_factory=list)
+    _checkpoint: int = field(init=False)
+    _diffs: list[FileDiff] = field(default_factory=list)
+    _step: int = field(init=False, default=0)
+    _state_hash: str = field(init=False, default="")
+    _scaffolded_files: list[Path] = field(default_factory=list)
+    _scaffolded_dirs: list[Path] = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        self._fs = OverlayFSCommands(self.project.fscommands)
-        self.project.fscommands = self._fs  # type: ignore[assignment]
-        self._stack = ChangeStack(self.project)
+        self._checkpoint = len(self.project.history.undo_list)
+        project_root = Path(self.project.root.real_path)
+        self._state_hash = _compute_state_hash(project_root)
 
-    def get_resource(self, file_path: Path) -> File:
-        rel = str(file_path.resolve().relative_to(self.project.address))
+    def get_resource(self, file_path: str | Path) -> File:
+        path = Path(file_path)
+        if path.is_absolute():
+            rel = str(path.relative_to(self.project.address))
+        else:
+            rel = str(path)
         return self.project.get_resource(rel)
+
+    def ensure_package(self, dest_dir: str) -> None:
+        """Create directories and __init__.py files needed for rope import resolution.
+
+        Creates scaffolding directly on the filesystem — not through rope's
+        Change API — so it never enters rope's undo history. Call
+        cleanup_scaffolding() to remove them after the refactor (or undo).
+
+        Skips __init__.py creation for directories that rope recognises as
+        source folders (both user-configured and auto-discovered), since adding
+        __init__.py would turn them into packages and break import resolution
+        (e.g. ``src/`` would produce ``src.myapp.x`` imports).
+        """
+        project_root = Path(self.project.root.real_path)
+        source_folders = {sf.path for sf in self.project.get_source_folders()}
+        parts = Path(dest_dir).parts
+
+        for i in range(len(parts)):
+            current = Path(*parts[: i + 1])
+            full = project_root / current
+
+            if not full.exists():
+                full.mkdir()
+                self._scaffolded_dirs.append(full)
+                print(f"  Created directory: {current}")
+
+            if str(current) in source_folders:
+                continue
+
+            init = full / "__init__.py"
+            if not init.exists():
+                init.touch()
+                self._scaffolded_files.append(init)
+                print(f"  Created __init__.py: {current / '__init__.py'}")
+
+        self.project.validate()
+
+    def ensure_module(self, dotted_name: str) -> Path:
+        """Ensure a dotted module path exists on disk, creating packages and leaf file.
+
+        Creates intermediate directories + __init__.py via ensure_package(),
+        then creates the leaf .py file if needed. Everything is scaffolding.
+        Returns the absolute path to the leaf module file.
+        """
+        dest_resource = self.project.find_module(dotted_name)
+        if dest_resource is not None:
+            return Path(self.project.root.real_path) / dest_resource.path
+
+        project_root = Path(self.project.root.real_path)
+        parts = dotted_name.split(".")
+
+        if len(parts) > 1:
+            self.ensure_package(str(Path(*parts[:-1])))
+
+        leaf_filename = parts[-1] + ".py"
+        if len(parts) > 1:
+            leaf_path = project_root / Path(*parts[:-1]) / leaf_filename
+        else:
+            leaf_path = project_root / leaf_filename
+
+        if not leaf_path.exists():
+            leaf_path.touch()
+            self._scaffolded_files.append(leaf_path)
+            self.project.validate()
+            print(f"  Created module: {leaf_path.relative_to(project_root)}")
+
+        return leaf_path
+
+    def cleanup_scaffolding(self) -> None:
+        """Remove scaffolded __init__.py files and empty directories."""
+        for f in reversed(self._scaffolded_files):
+            if f.exists():
+                f.unlink()
+        self._scaffolded_files.clear()
+        for d in reversed(self._scaffolded_dirs):
+            if d.exists() and not any(d.iterdir()):
+                d.rmdir()
+        self._scaffolded_dirs.clear()
+        self.project.validate()
 
     def find_files(
         self,
-        directory: Path,
         patterns: Iterable[str] = (),
         include: Iterable[str] = (),
         exclude: Iterable[str] = (),
@@ -159,6 +292,7 @@ class RefactorContext:
 
         When ``patterns`` is empty, returns all glob-matched files.
         """
+        directory = Path(self.project.root.real_path)
         pattern_list = list(patterns)
         include_list = list(include)
         exclude_list = list(exclude)
@@ -222,41 +356,75 @@ class RefactorContext:
             "Install ripgrep or ensure grep is available."
         )
 
-    def write(self, resource: File, new_source: str) -> None:
-        """Queue a file write. The change is visible to subsequent reads
-        via the in-memory overlay — nothing touches disk until commit()."""
-        original = resource.read()
-        if new_source != original:
-            self._pending.append(PendingWrite(resource, original, new_source))
-            change = ChangeSet(f"Change <{resource.path}>")
-            change.add_change(ChangeContents(resource, new_source))
-            self._stack.push(change)
-
     def do(self, changes: Change) -> None:
-        """Apply a rope Change (e.g. from Rename, Move, Extract).
-        Captures ChangeContents into _pending for diff/backup tracking,
-        and non-content changes into _ops for display.
-        Then pushes onto the ChangeStack so reads see the result."""
+        """Apply a rope Change to disk and record diffs for display.
+
+        Tags the change description with [refactor:<hash>] so undo/redo
+        scripts can identify all changes from a single refactor run.
+        """
+        self._step += 1
+
+        # Tag the change with our run hash
+        if self._state_hash and hasattr(changes, "description"):
+            tag = f"{REFACTOR_TAG_PREFIX}{self._state_hash}]"
+            if not changes.description.startswith(REFACTOR_TAG_PREFIX):
+                changes.description = f"{tag} {changes.description}"
+
         leaves = self._iter_changes(changes)
-        # Collect moves so we can annotate content changes with new paths
+
+        # Collect moves and snapshot originals before applying
         moves: dict[str, str] = {}
-        for change in leaves:
-            if isinstance(change, MoveResource):
-                moves[change.resource.path] = change.new_resource.path
-        for change in leaves:
-            if isinstance(change, ChangeContents):
-                original = change.resource.read()
-                self._pending.append(
-                    PendingWrite(
-                        change.resource,
-                        original,
-                        change.new_contents,
-                        new_path=moves.get(change.resource.path),
-                    )
+        snapshots: dict[str, str] = {}
+        for leaf in leaves:
+            if isinstance(leaf, MoveResource):
+                moves[leaf.resource.path] = leaf.new_resource.path
+        for leaf in leaves:
+            if isinstance(leaf, ChangeContents):
+                try:
+                    snapshots[leaf.resource.path] = leaf.resource.read()
+                except (FileNotFoundError, AttributeError) as e:
+                    print(f"  Warning: could not read {leaf.resource.path}: {e}")
+                    snapshots[leaf.resource.path] = ""
+
+        self.project.do(changes)
+
+        # Record diffs
+        for path, original in snapshots.items():
+            actual_path = moves.get(path, path)
+            resource = self.project.get_resource(actual_path)
+            self._diffs.append(
+                FileDiff(
+                    path=path,
+                    original=original,
+                    new_source=resource.read(),
+                    new_path=moves.get(path),
+                    step=self._step,
                 )
-            else:
-                self._ops.append(PendingOp(change.get_description()))
-        self._stack.push(changes)
+            )
+
+    def undo_all(self, *, drop: bool = False, verbose: bool = False) -> None:
+        """Undo all changes back to the checkpoint, then remove scaffolding.
+
+        Args:
+            drop: If True, undone changes are not kept in redo history.
+                Use drop=True for failed refactors (partial garbage).
+                Use drop=False for dry-run (valid changes, keep for redo).
+            verbose: If True, print each changeset being undone.
+        """
+        to_undo = len(self.project.history.undo_list) - self._checkpoint
+        if to_undo <= 0:
+            self.cleanup_scaffolding()
+            return
+        undone = 0
+        while len(self.project.history.undo_list) > self._checkpoint:
+            change = self.project.history.undo_list[-1]
+            # Access description before undo — forces rope to resolve lazy state
+            desc = getattr(change, "description", str(change))
+            self.project.history.undo(drop=drop)
+            undone += 1
+            if verbose:
+                print(f"  [{undone}/{to_undo}] Undone: {desc}")
+        self.cleanup_scaffolding()
 
     def _iter_changes(self, changes: Change) -> list[Change]:
         """Flatten a Change tree into leaf changes."""
@@ -267,51 +435,103 @@ class RefactorContext:
             return result
         return [changes]
 
-    def commit(self) -> None:
-        """Flush all accumulated changes to disk."""
-        self._fs.commit()
+
+def extract_refactor_hash(description: str) -> str | None:
+    """Extract the refactor hash from a tagged change description.
+
+    Returns the 8-char hex hash, or None if the description is not tagged.
+    """
+    if description.startswith(REFACTOR_TAG_PREFIX):
+        end = description.find("]", len(REFACTOR_TAG_PREFIX))
+        if end == -1:
+            return None
+        return description[len(REFACTOR_TAG_PREFIX) : end]
+    return None
 
 
-def _in_git_repo(cwd: Path) -> bool:
-    """Check if cwd is inside a git repository."""
+def _git_repo_root(cwd: Path) -> Path | None:
+    """Return the git repository root, or None if not in a repo."""
     result = subprocess.run(
-        ["git", "rev-parse", "--git-dir"],
-        capture_output=True,
-        cwd=cwd,
-    )
-    return result.returncode == 0
-
-
-def _check_git_clean(cwd: Path) -> None:
-    """Ensure all changes are staged or committed before refactoring."""
-    result = subprocess.run(
-        ["git", "diff", "--name-only"],
+        ["git", "rev-parse", "--show-toplevel"],
         capture_output=True,
         text=True,
         cwd=cwd,
     )
-    unstaged = result.stdout.strip()
-    if unstaged:
-        print("Error: unstaged changes detected. Stage or commit before refactoring.")
-        print(unstaged)
+    if result.returncode == 0:
+        return Path(result.stdout.strip())
+    return None
+
+
+def resolve_project_root(project_root: Path | None) -> Path:
+    """Resolve the project root, defaulting to the git repository root."""
+    if project_root is not None:
+        return project_root.resolve()
+    detected = _git_repo_root(Path.cwd())
+    if detected is None:
+        print("Error: not in a git repo. Pass --project-root explicitly.")
         sys.exit(1)
+    return detected
 
 
-def run(
-    refactor_fn: RefactorFn,
-    *,
+def _print_changes(
+    diffs: list[FileDiff], show_diff: bool, *, applied: bool = False
+) -> None:
+    """Print change summary, grouping diffs by step when steps are non-trivial.
+
+    Only shows step headers when there are multiple steps AND at least one
+    step produced multiple diffs (i.e., a multi-file operation like MoveModule).
+    Single-file-per-step patterns (like add_imports iterating files) stay flat.
+    """
+    total = len(diffs)
+    max_step = max((d.step for d in diffs), default=0)
+    # Show step grouping when steps are meaningful (not just one diff per step)
+    group_steps = max_step > 1 and total > max_step
+
+    if applied:
+        print(f"Applied {total} change(s):")
+    elif show_diff:
+        print(f"Would apply {total} change(s):")
+    else:
+        print(f"[dry-run] Would apply {total} change(s):")
+
+    prev_step = 0
+    for diff in diffs:
+        if group_steps and diff.step != prev_step:
+            print(f"  Step {diff.step}:")
+            prev_step = diff.step
+        if show_diff and not applied:
+            sys.stdout.write(_format_diff(diff))
+        else:
+            label = diff.path
+            if diff.new_path:
+                label = f"{diff.path} -> {diff.new_path}"
+            indent = "    " if group_steps else "  "
+            print(f"{indent}{label}")
+
+
+def _verify_snapshot(snapshot: GitSnapshot, context: str) -> None:
+    """Warn if undo didn't fully restore the original state."""
+    diffs = snapshot.verify()
+    if diffs:
+        print(f"ERROR: {context} — files differ from pre-refactor state:")
+        for line in diffs:
+            print(f"  {line}")
+        print(
+            "This is a bug. Run `git diff` to inspect and `git checkout .` to recover."
+        )
+
+
+def build_parser(
     description: str = "",
     setup_args: SetupArgsFn | None = None,
-) -> None:
-    """Bootstrap entry point. Parses args, sets up rope, runs the refactor."""
-    import argparse
-
-    parser = argparse.ArgumentParser(description=description or "Rope refactor script")
+) -> ArgumentParser:
+    """Build the argument parser for a refactor script."""
+    parser = ArgumentParser(description=description or "Rope refactor script")
     parser.add_argument(
         "--project-root",
         type=Path,
-        required=True,
-        help="Rope project root (repository root)",
+        default=None,
+        help="Rope project root (default: git repository root)",
     )
     parser.add_argument(
         "--dry-run",
@@ -321,81 +541,87 @@ def run(
     parser.add_argument(
         "--diff",
         action="store_true",
-        help="Show unified diff of changes (implies --dry-run on first run)",
-    )
-    parser.add_argument(
-        "--backup",
-        action="store_true",
-        help="Create .bak files before writing (for use outside git repos)",
+        help="Show unified diff of changes (implies --dry-run)",
     )
     if setup_args:
         setup_args(parser)
-    args = parser.parse_args()
+    return parser
 
-    project_root = args.project_root.resolve()
+
+def run(
+    refactor_fn: RefactorFn,
+    *,
+    description: str = "",
+    setup_args: SetupArgsFn | None = None,
+    args: Namespace | None = None,
+) -> None:
+    """Bootstrap entry point. Parses args, sets up rope, runs the refactor."""
+    if args is None:
+        args = build_parser(description, setup_args).parse_args()
+
+    project_root = resolve_project_root(args.project_root)
     dry_run = args.dry_run or args.diff
     show_diff = args.diff
-
-    # Safety check: ensure we can revert (skip in dry-run)
-    if not dry_run:
-        if _in_git_repo(project_root):
-            _check_git_clean(project_root)
-        elif not args.backup:
-            print(
-                "Error: not in a git repo. Use --backup to create .bak files, or --dry-run."
-            )
-            sys.exit(1)
 
     project = Project(str(project_root))
     ctx = RefactorContext(project=project, args=args, dry_run=dry_run)
 
+    if ctx._state_hash:
+        print(f"Refactor run {ctx._state_hash}")
+
+    # Snapshot git state for undo verification (use repo root, not project root)
+    git_root = _git_repo_root(project_root)
+    if git_root is not None:
+        snapshot = GitSnapshot.capture(git_root)
+    else:
+        snapshot = GitSnapshot.unavailable(project_root)
+
     try:
         refactor_fn(ctx)
     except Exception:
+        ctx.undo_all(drop=True, verbose=True)
+        _verify_snapshot(snapshot, "after failed refactor undo")
         project.close()
         raise
 
-    if not ctx._pending and not ctx._ops:
+    if not ctx._diffs:
         print("No changes needed.")
-        project.close()
-        return
-
-    if dry_run:
-        total = len(ctx._pending) + len(ctx._ops)
-        print(f"{'[dry-run] ' if not show_diff else ''}Would apply {total} change(s):")
-        for op in ctx._ops:
-            print(op.description)
-        for pw in ctx._pending:
-            if show_diff:
-                sys.stdout.write(_format_diff(pw))
-            else:
-                print(f"  {pw.resource.path}")
+    elif dry_run:
+        _print_changes(ctx._diffs, show_diff)
+        ctx.undo_all()
+        _verify_snapshot(snapshot, "after dry-run undo")
+        print()
+        print("To apply, re-run without --diff/--dry-run.")
     else:
-        if args.backup:
-            for pw in ctx._pending:
-                bak_path = Path(project_root) / (pw.resource.path + ".bak")
-                bak_path.write_text(pw.original)
-        ctx.commit()
-        total = len(ctx._pending) + len(ctx._ops)
-        print(f"Applied {total} change(s):")
-        for op in ctx._ops:
-            print(op.description)
-        for pw in ctx._pending:
-            suffix = " (.bak created)" if args.backup else ""
-            print(f"  {pw.resource.path}{suffix}")
+        ctx.cleanup_scaffolding()
+        _print_changes(ctx._diffs, show_diff=False, applied=True)
 
     project.close()
 
 
-def _format_diff(pw: PendingWrite) -> str:
-    """Return a unified diff string with line numbers for a pending write."""
+# ANSI color codes for diff output (respect NO_COLOR convention)
+if os.environ.get("NO_COLOR") is not None:
+    _RED = _GREEN = _CYAN = _BOLD = _DIM = _RESET = ""
+else:
+    _RED = "\033[31m"
+    _GREEN = "\033[32m"
+    _CYAN = "\033[36m"
+    _BOLD = "\033[1m"
+    _DIM = "\033[2m"
+    _RESET = "\033[0m"
+
+
+def _format_diff(diff: FileDiff) -> str:
+    """Return a unified diff string with line numbers and ANSI colors."""
     import difflib
     import re
 
-    old_path = pw.resource.path
-    new_path = pw.new_path or old_path
-    original_lines = pw.original.splitlines(keepends=True)
-    new_lines = pw.new_source.splitlines(keepends=True)
+    old_path = diff.path
+    new_path = diff.new_path or old_path
+    original = diff.original or ""
+    new_source = diff.new_source or ""
+    original_lines = original.splitlines(keepends=True)
+    new_lines = new_source.splitlines(keepends=True)
     raw = difflib.unified_diff(
         original_lines, new_lines, f"a/{old_path}", f"b/{new_path}"
     )
@@ -405,7 +631,6 @@ def _format_diff(pw: PendingWrite) -> str:
     # Determine width needed for line numbers
     max_ln = max(len(original_lines), len(new_lines))
     w = max(len(str(max_ln)), 1)
-    blank = " " * w
     for line in raw:
         if line.startswith("@@"):
             m = re.match(r"@@ -(\d+)", line)
@@ -414,17 +639,19 @@ def _format_diff(pw: PendingWrite) -> str:
             m2 = re.match(r"@@ -\d+(?:,\d+)? \+(\d+)", line)
             if m2:
                 new_ln = int(m2.group(1))
-            out.append(line)
-        elif line.startswith("---") or line.startswith("+++"):
-            out.append(line)
+            out.append(f"{_CYAN}{line}{_RESET}")
+        elif line.startswith("---"):
+            out.append(f"{_BOLD}{line}{_RESET}")
+        elif line.startswith("+++"):
+            out.append(f"{_BOLD}{line}{_RESET}")
         elif line.startswith("-"):
-            out.append(f"{old_ln:>{w}}\u2192 {line}")
+            out.append(f"{_DIM}{old_ln:>{w}}\u2192 {_RESET}{_RED}{line}{_RESET}")
             old_ln += 1
         elif line.startswith("+"):
-            out.append(f"{new_ln:>{w}}\u2192 {line}")
+            out.append(f"{_DIM}{new_ln:>{w}}\u2192 {_RESET}{_GREEN}{line}{_RESET}")
             new_ln += 1
         else:
-            out.append(f"{old_ln:>{w}}\u2192 {line}")
+            out.append(f"{_DIM}{old_ln:>{w}}\u2192 {_RESET}{line}")
             old_ln += 1
             new_ln += 1
     return "".join(out)

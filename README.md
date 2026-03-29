@@ -1,6 +1,6 @@
 # python-refactor
 
-A Claude Code skill for AST-aware Python refactoring using [python-rope](https://github.com/python-rope/rope). Safer than regex for source code transformation — handles parameter annotations, import management, rename, move, and custom batch edits with precise byte-offset editing.
+A Claude Code skill for AST-aware Python refactoring using [python-rope](https://github.com/python-rope/rope). Safer than regex for source code transformation — handles parameter annotations, import management, rename, move, and custom batch edits with precise offset editing.
 
 ## Prerequisites
 
@@ -35,16 +35,18 @@ Refactor scripts are run via `uv run` using a bootstrap (`scripts/rope_bootstrap
 
 - Rope project setup and resource management
 - `--dry-run` and `--diff` modes (always runs dry first)
-- Git dirty-state safety checks
+- Changes written via rope's history with automatic undo/redo support
 - File selection with glob + text pre-filtering (ripgrep, with grep fallback)
-- In-memory write overlay so multiple edits compose safely
 
-## Included factories
+## Included tools
 
-| Factory                  | Purpose                                        |
+| Script / Factory         | Purpose                                        |
 | ------------------------ | ---------------------------------------------- |
 | `add_param_annotations`  | Batch-annotate function parameters across files |
 | `add_import`             | Add imports to files matching a predicate       |
+| `move_globals`           | Move top-level symbols between modules          |
+| `move_module`            | Move or rename a module (MoveModule)            |
+| `refactor_history`       | Undo or redo a refactor run by state hash        |
 
 For cases these don't cover, write a custom script — see `custom_scripts.md`.
 

@@ -14,7 +14,7 @@ def test_no_patterns_returns_all_py_files(tmp_path: Path) -> None:
     proj.create_file("c.txt", "not python\n")
 
     ctx = proj.make_context()
-    files = ctx.find_files(tmp_path)
+    files = ctx.find_files()
 
     assert len(files) == 2
     assert all(f.suffix == ".py" for f in files)
@@ -27,7 +27,7 @@ def test_no_patterns_respects_include(tmp_path: Path) -> None:
     proj.create_file("helper.py", "y = 2\n")
 
     ctx = proj.make_context()
-    files = ctx.find_files(tmp_path, include=["test_*.py"])
+    files = ctx.find_files(include=["test_*.py"])
 
     assert len(files) == 1
     assert files[0].name == "test_foo.py"
@@ -40,7 +40,7 @@ def test_no_patterns_respects_exclude(tmp_path: Path) -> None:
     proj.create_file("b.py", "y = 2\n")
 
     ctx = proj.make_context()
-    files = ctx.find_files(tmp_path, exclude=["b.py"])
+    files = ctx.find_files(exclude=["b.py"])
 
     assert len(files) == 1
     assert files[0].name == "a.py"
@@ -53,7 +53,7 @@ def test_patterns_filter_by_content(tmp_path: Path) -> None:
     proj.create_file("no_match.py", "x = 1\n")
 
     ctx = proj.make_context()
-    files = ctx.find_files(tmp_path, patterns=["capsys"])
+    files = ctx.find_files(patterns=["capsys"])
 
     assert len(files) == 1
     assert files[0].name == "has_it.py"
@@ -67,7 +67,7 @@ def test_patterns_intersected_with_globs(tmp_path: Path) -> None:
     proj.create_file("helper.py", "capsys here too\n")
 
     ctx = proj.make_context()
-    files = ctx.find_files(tmp_path, patterns=["capsys"], include=["test_*.py"])
+    files = ctx.find_files(patterns=["capsys"], include=["test_*.py"])
 
     assert len(files) == 1
     assert files[0].name == "test_foo.py"
@@ -80,7 +80,7 @@ def test_patterns_excluded_by_glob(tmp_path: Path) -> None:
     proj.create_file("b.py", "capsys here\n")
 
     ctx = proj.make_context()
-    files = ctx.find_files(tmp_path, patterns=["capsys"], exclude=["b.py"])
+    files = ctx.find_files(patterns=["capsys"], exclude=["b.py"])
 
     assert len(files) == 1
     assert files[0].name == "a.py"
@@ -92,7 +92,7 @@ def test_patterns_no_matches_returns_empty(tmp_path: Path) -> None:
     proj.create_file("a.py", "x = 1\n")
 
     ctx = proj.make_context()
-    files = ctx.find_files(tmp_path, patterns=["nonexistent_symbol"])
+    files = ctx.find_files(patterns=["nonexistent_symbol"])
 
     assert files == []
     proj.close()
@@ -105,7 +105,7 @@ def test_returns_sorted(tmp_path: Path) -> None:
     proj.create_file("b.py", "x\n")
 
     ctx = proj.make_context()
-    files = ctx.find_files(tmp_path)
+    files = ctx.find_files()
 
     assert files == sorted(files)
     proj.close()
@@ -126,7 +126,7 @@ def test_grep_falls_back_to_grep_when_rg_missing(tmp_path: Path) -> None:
         return original_which(cmd)
 
     with patch("rope_bootstrap.shutil.which", side_effect=no_rg):
-        files = ctx.find_files(tmp_path, patterns=["capsys"])
+        files = ctx.find_files(patterns=["capsys"])
 
     assert len(files) == 1
     assert files[0].name == "a.py"
@@ -141,7 +141,7 @@ def test_grep_raises_when_neither_rg_nor_grep(tmp_path: Path) -> None:
 
     with patch("rope_bootstrap.shutil.which", return_value=None):
         try:
-            ctx.find_files(tmp_path, patterns=["capsys"])
+            ctx.find_files(patterns=["capsys"])
             assert False, "Expected FileNotFoundError"
         except FileNotFoundError as e:
             assert "rg" in str(e)
@@ -156,7 +156,7 @@ def test_prints_search_info(tmp_path: Path, capsys: object) -> None:
     proj.create_file("b.py", "x = 1\n")
 
     ctx = proj.make_context()
-    ctx.find_files(tmp_path, patterns=["capsys"])
+    ctx.find_files(patterns=["capsys"])
 
     captured = capsys.readouterr()  # type: ignore[union-attr]
     assert "glob:" in captured.out
@@ -170,7 +170,7 @@ def test_no_patterns_prints_glob_only(tmp_path: Path, capsys: object) -> None:
     proj.create_file("a.py", "x = 1\n")
 
     ctx = proj.make_context()
-    ctx.find_files(tmp_path)
+    ctx.find_files()
 
     captured = capsys.readouterr()  # type: ignore[union-attr]
     assert "glob:" in captured.out

@@ -1,11 +1,11 @@
 ---
 name: python-refactor
-description: Perform AST-aware Python refactors using the rope library. Handles parameter annotations, import management, rename, move, and custom source transformations with precise byte-offset edits. Triggers: "add type annotations", "refactor with rope", "python refactor skill", "python refactor tool", "add imports", "rename across files", "annotate parameters", or needs AST-aware Python source code transformation.
+description: Perform AST-aware Python refactors using the rope library. Handles parameter annotations, import management, rename, move, and custom source transformations with precise offset edits. Triggers: "add type annotations", "refactor with rope", "python refactor skill", "python refactor tool", "add imports", "rename across files", "annotate parameters", or needs AST-aware Python source code transformation.
 ---
 
 # Python Refactor
 
-Use python-rope for AST-aware Python refactoring. Rope provides precise byte-offset editing, import management, and cross-file rename/move — safer than regex for source code transformation.
+Use python-rope for AST-aware Python refactoring. Rope provides precise offset editing, import management, and cross-file rename/move — safer than regex for source code transformation.
 
 ## Prerequisites
 
@@ -24,9 +24,50 @@ Rope must be a dev dependency: `uv add --dev rope`
 
 **Key threshold:** Count distinct _files_, not total occurrences. A param appearing 40 times across 10 files → rope script. A param appearing 3 times in 2 files → direct edits.
 
+## Project structure and rope configuration
+
+Rope auto-detects source folders by walking the directory tree. A folder that directly contains a package (a subfolder with `__init__.py`) is treated as a source folder. A folder with `.py` files but no packages is also treated as a source folder.
+
+For an idiomatic Python layout:
+
+```
+myproject/
+  pyproject.toml
+  src/
+    myapp/
+      __init__.py
+      models.py
+      handlers/
+        __init__.py
+        status.py
+  tests/
+    test_models.py
+```
+
+Rope auto-detects `src/` as a source folder (because it contains `myapp/` which has `__init__.py`) and `tests/` as a source folder (because it contains `.py` files). This means `src/myapp/models.py` resolves as `myapp.models`.
+
+No `source_folders` configuration is needed for this layout. However, `preferred_import_style` should be set to control how rope writes new imports:
+
+```toml
+[tool.rope.imports]
+preferred_import_style = "from-global"
+```
+
+Without this, rope defaults to normal imports (`import myapp.models`) instead of from-imports (`from myapp.models import DeviceInfo`).
+
+**Important:** source folder roots (like `src/`) must never contain an `__init__.py` file. If they do, rope treats them as packages and generates prefixed imports like `src.myapp.models`. The bootstrap's `ensure_package` automatically skips `__init__.py` creation for directories listed in `source_folders`.
+
+## Bootstrap flags
+
+All scripts inherit these flags from the bootstrap — no need to add them manually:
+
+- `--project-root` — rope project root (defaults to git repository root, so usually omitted)
+- `--dry-run` — show what would change without modifying files
+- `--diff` — show unified diff (implies `--dry-run`)
+
 ## Built-in refactorings
 
-Rope's built-in refactorings need a byte offset. Never count bytes manually — use a line number (from the Read tool) + symbol name, then resolve to an offset in the script:
+Rope's built-in refactorings need a string offset. Never count offsets manually — use rope's `SourceLinesAdapter` (available as `pymodule.lines`) to convert a line number + symbol name to an offset:
 
 ```python
 import sys
@@ -45,12 +86,11 @@ def setup_args(parser):
 
 def refactor(ctx: RefactorContext) -> None:
     resource = ctx.get_resource(ctx.args.file)
+    pymodule = ctx.project.get_pymodule(resource)
     source = resource.read()
-    # Resolve line + symbol name → byte offset
-    lines = source.split("\n")
-    line_start = sum(len(lines[i]) + 1 for i in range(ctx.args.line - 1))
-    col = lines[ctx.args.line - 1].index(ctx.args.symbol)
-    offset = line_start + col
+    # Resolve line + symbol name → offset
+    line_start = pymodule.lines.get_line_start(ctx.args.line)
+    offset = line_start + source[line_start:].index(ctx.args.symbol)
     changes = Rename(ctx.project, resource, offset).get_changes(ctx.args.new_name)
     ctx.do(changes)
 
@@ -63,7 +103,7 @@ See [rope-api.md](rope-api.md) for full usage details.
 
 ## Adding type annotations to parameters
 
-**Prefer reusing `add_param_annotations`** over writing new scripts. The factory handles rg pre-filtering, AST walking, import insertion, and byte-offset annotation in one call.
+**Prefer reusing `add_param_annotations`** over writing new scripts. The factory handles rg pre-filtering, AST walking, import insertion, and offset-based annotation in one call.
 
 ```python
 import sys
@@ -142,6 +182,79 @@ Rope handles deduplication — the import won't be added if already present.
 
 See [imports.md](imports.md) — MANDATORY when writing custom import logic.
 
+## Moving modules between directories
+
+**Prefer reusing `move_module`** over writing custom move scripts. It handles directory creation, import rewriting across the project, and optional rename in one operation:
+
+```bash
+uv run python scripts/move_module.py \
+    --diff \
+    src/pkg/handlers/status.py \
+    src/pkg/features/status/daemon \
+    --rename handler
+```
+
+Parameters:
+
+- `source` — path to the module file to move
+- `dest_dir` — destination directory (relative to project root)
+- `--rename` — optional new name for the module (without `.py`)
+- `--diff` — show unified diff without applying (implies `--dry-run`)
+- `--dry-run` — show what would change without modifying files
+
+The destination directory and intermediate `__init__.py` files are created automatically as scaffolding for rope's import resolution. Scaffolding is cleaned up after the operation — only the moved file and updated imports persist.
+
+**Import rewriting:** All `from` and `import` statements across the project are updated to reflect the new location.
+
+## Moving globals between modules
+
+**Prefer reusing `move_globals`** over writing custom move scripts. It handles batch moves with upfront validation, automatic stale import cleanup in the destination, and caller rewriting:
+
+```python
+import sys
+from pathlib import Path
+
+SKILL_SCRIPTS = "/absolute/path/to/skill/scripts"
+sys.path.insert(0, SKILL_SCRIPTS)
+from move_globals import refactor, setup_args
+from rope_bootstrap import run
+
+run(refactor, description="Move symbols", setup_args=setup_args)
+```
+
+Or invoke directly:
+
+```bash
+uv run python scripts/move_globals.py \
+    --diff \
+    src/pkg/source.py pkg.dest.module SYMBOL1 SYMBOL2
+```
+
+The destination module and intermediate packages are created automatically if they don't exist. Intermediate `__init__.py` files are scaffolded for rope's import resolution and cleaned up after the operation.
+
+**Symbol order matters:** Move dependencies before dependents. If symbol B references symbol A and both are being moved, list A first. Otherwise rope adds a temporary import of A from the source into the destination, which becomes stale once A moves.
+
+**Stale import cleanup:** Before each move, the script checks if the destination already imports the symbol and removes it to prevent circular imports.
+
+**Validation:** All symbols are validated as locally defined (not imported) in the source before any changes are made.
+
+**Undo/redo:** Each refactor run is tagged with a state hash. Use `refactor_history.py undo` to reverse the most recent run, or `refactor_history.py redo` to reapply a previously undone run.
+
+## Undo / Redo
+
+All changes applied via `ctx.do()` are tracked through rope's history with state hash tagging. A single script manages both undo and redo:
+
+- **`refactor_history.py undo`** — undoes the most recent refactor run by hash.
+- **`refactor_history.py redo`** — redoes a previously undone run.
+
+```bash
+# Undo the last refactor
+uv run python scripts/refactor_history.py undo
+
+# Redo a previously undone refactor
+uv run python scripts/refactor_history.py redo
+```
+
 ## Custom refactoring scripts
 
 If none of the existing solutions fit, a custom refactor script can be created. All scripts MUST use the bootstrap though. See [custom_scripts.md](custom_scripts.md) — MANDATORY when writing any refactor script.
@@ -151,28 +264,30 @@ If none of the existing solutions fit, a custom refactor script can be created. 
 Use `ctx.find_files()` to select files. It combines glob matching with optional text pre-filtering (via ripgrep, falling back to grep):
 
 ```python
-# All .py files in directory
-files = ctx.find_files(directory)
+# All .py files in the project
+files = ctx.find_files()
 
 # Only files containing "cmd" or "send", filtered by globs
 files = ctx.find_files(
-    directory,
     patterns={"cmd", "send"},
     include=["tests/**/*.py"],
     exclude=["conftest.py"],
 )
 ```
 
-When `patterns` is provided, only files containing a match are included. The result is always intersected with include/exclude globs. Logs which tool was used, how many files matched, and how many were excluded.
+Searches from the project root. When `patterns` is provided, only files containing a match are included. The result is always intersected with include/exclude globs. Logs which tool was used, how many files matched, and how many were excluded.
 
 ## References
 
 | File                                   | Contents                                                                                         | Load                                           |
 | -------------------------------------- | ------------------------------------------------------------------------------------------------ | ---------------------------------------------- |
-| [custom_scripts.md](custom_scripts.md) | Bootstrap usage, RefactorContext API (match_globs, grep_files, write, do), built-in refactorings | MANDATORY when writing any refactor script     |
+| [custom_scripts.md](custom_scripts.md) | Bootstrap usage, RefactorContext API (find_files, do), ChangeSet pattern, built-in refactorings   | MANDATORY when writing any refactor script     |
 | [annotations.md](annotations.md)       | AST + ChangeCollector pattern for custom annotation logic                                        | MANDATORY when writing custom annotation logic |
 | [imports.md](imports.md)               | ModuleImports, NormalImport, FromImport API                                                      | MANDATORY when writing custom import logic     |
 | [rope-api.md](rope-api.md)             | Full rope API reference (Rename, Move, Extract, etc.)                                            | Optional — for built-in refactorings           |
+| `move_module.py`                       | Move a module to a new directory, rewriting all imports. Supports `--rename`.                     | Run directly from CLI                          |
+| `move_globals.py`                      | Move global symbols between modules with stale import cleanup                                    | Run directly from CLI                          |
+| `refactor_history.py`                  | Undo/redo refactor runs by state hash (`undo` or `redo` subcommand)                              | Run after a refactor to reverse or reapply     |
 
 ## Keywords
 

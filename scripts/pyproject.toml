@@ -5,8 +5,13 @@ description = "Add your description here"
 requires-python = ">=3.14"
 dependencies = []
 
+[tool.pytest.ini_options]
+filterwarnings = ["ignore::DeprecationWarning:rope"]
+testpaths = ["tests"]
+
 [dependency-groups]
 dev = [
     "pytest>=9.0.2",
+    "pytest-cov>=7.1.0",
     "rope>=1.14.0",
 ]

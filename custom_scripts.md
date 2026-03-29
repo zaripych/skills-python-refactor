@@ -1,6 +1,6 @@
 # Writing Custom Refactor Scripts
 
-All refactor scripts MUST use [scripts/rope_bootstrap.py](scripts/rope_bootstrap.py). It provides project setup, `--dry-run`, `--diff`, `--backup`, git safety checks, and the `RefactorContext` with file selection helpers.
+All refactor scripts MUST use [scripts/rope_bootstrap.py](scripts/rope_bootstrap.py). It provides project setup, `--dry-run`, `--diff`, git safety checks, and the `RefactorContext` with file selection helpers.
 
 ## Script template
 
@@ -12,16 +12,19 @@ from pathlib import Path
 SKILL_SCRIPTS = "/absolute/path/to/skill/scripts"  # use the actual skill path
 sys.path.insert(0, SKILL_SCRIPTS)
 from rope_bootstrap import RefactorContext, run
+from rope.refactor.rename import Rename
 
 def setup_args(parser: ArgumentParser) -> None:
-    parser.add_argument("directory", type=Path, help="Directory to scan")
+    parser.add_argument("source", type=Path, help="Source file")
 
 def refactor(ctx: RefactorContext) -> None:
-    for f in sorted(ctx.args.directory.rglob("*.py")):
-        resource = ctx.get_resource(f)
-        source = resource.read()
-        # ... compute new_source ...
-        ctx.write(resource, new_source)
+    resource = ctx.get_resource(ctx.args.source)
+    pymodule = ctx.project.get_pymodule(resource)
+    source = resource.read()
+    line_start = pymodule.lines.get_line_start(line_number)
+    offset = line_start + source[line_start:].index("symbol_name")
+    changes = Rename(ctx.project, resource, offset).get_changes("new_name")
+    ctx.do(changes)
 
 if __name__ == "__main__":
     run(refactor, description="My refactor script", setup_args=setup_args)
@@ -33,10 +36,9 @@ if __name__ == "__main__":
 
 The bootstrap provides these flags automatically — no need to add them:
 
-- `--project-root` (required) — rope project root (repository root)
+- `--project-root` (optional) — rope project root (defaults to git repository root)
 - `--dry-run` — show what would change without modifying files
 - `--diff` — show unified diff (implies `--dry-run`)
-- `--backup` — create `.bak` files before writing (for non-git repos)
 
 Each refactor script adds its own args via `setup_args`. Access all parsed args through `ctx.args`.
 
@@ -54,11 +56,14 @@ Use `ctx.find_files()` for file selection — see SKILL.md for usage and paramet
 resource = ctx.get_resource(file_path)   # Path → rope File resource
 source = resource.read()                 # current source text
 
-ctx.write(resource, new_source)          # queue a change (never call resource.write())
-ctx.do(changes)                          # apply a rope Change (Rename, Move, etc.)
+# Build a ChangeSet and apply it — changes write to disk immediately via rope's history
+from rope.base.change import ChangeSet, ChangeContents
+cs = ChangeSet("description")
+cs.add_change(ChangeContents(resource, new_source))
+ctx.do(cs)                               # apply changes (writes to disk, tagged for undo)
 ```
 
-`ctx.write()` uses an in-memory overlay — subsequent reads see prior writes without touching disk until `commit()`.
+Each `ctx.do()` call writes to disk immediately through `project.do()` and tags the change with a state hash for undo/redo support. Use `refactor_history.py undo` and `refactor_history.py redo` to reverse or reapply changes after a run.
 
 ### Project access
 
