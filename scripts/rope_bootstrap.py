@@ -183,7 +183,8 @@ class RefactorContext:
     _diffs: list[FileDiff] = field(default_factory=list)
     _step: int = field(init=False, default=0)
     _state_hash: str = field(init=False, default="")
-    _scaffolded_files: list[Path] = field(default_factory=list)
+    _scaffolded_inits: list[Path] = field(default_factory=list)
+    _scaffolded_modules: list[Path] = field(default_factory=list)
     _scaffolded_dirs: list[Path] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -230,17 +231,58 @@ class RefactorContext:
             init = full / "__init__.py"
             if not init.exists():
                 init.touch()
-                self._scaffolded_files.append(init)
+                self._scaffolded_inits.append(init)
                 print(f"  Created __init__.py: {current / '__init__.py'}")
 
         self.project.validate()
 
-    def ensure_module(self, dotted_name: str) -> Path:
+    def _resolve_source_root(
+        self, dotted_name: str, source_root: Path | None
+    ) -> Path | None:
+        """Resolve the source folder for scaffolding a new module.
+
+        1. If source_root is provided, use it directly.
+        2. Try to find the top-level package via rope's find_module and
+           determine which source folder contains it.
+        3. If still unknown: use the sole source folder, or raise if ambiguous.
+        """
+        if source_root is not None:
+            return source_root
+
+        project_root = Path(self.project.root.real_path)
+        parts = dotted_name.split(".")
+        top_resource = self.project.find_module(parts[0])
+        if top_resource is not None:
+            for sf in self.project.get_source_folders():
+                if sf.contains(top_resource):
+                    return Path(sf.real_path).relative_to(project_root)
+
+        source_folders = self.project.get_source_folders()
+        if len(source_folders) == 1:
+            return Path(source_folders[0].real_path).relative_to(project_root)
+
+        if len(source_folders) > 1:
+            names = [sf.path for sf in source_folders]
+            raise ValueError(
+                f"Multiple source folders {names} and top-level package "
+                f"'{parts[0]}' not found in any. Pass source_root to ensure_module()."
+            )
+
+        raise ValueError(
+            "No source folders found in the project. "
+            "Pass source_root to ensure_module()."
+        )
+
+    def ensure_module(self, dotted_name: str, source_root: Path | None = None) -> Path:
         """Ensure a dotted module path exists on disk, creating packages and leaf file.
 
         Creates intermediate directories + __init__.py via ensure_package(),
         then creates the leaf .py file if needed. Everything is scaffolding.
         Returns the absolute path to the leaf module file.
+
+        Args:
+            source_root: Source folder relative to project root (e.g. Path("src")).
+                If None, resolved automatically from rope's source folders.
         """
         dest_resource = self.project.find_module(dotted_name)
         if dest_resource is not None:
@@ -248,30 +290,45 @@ class RefactorContext:
 
         project_root = Path(self.project.root.real_path)
         parts = dotted_name.split(".")
+        base = self._resolve_source_root(dotted_name, source_root)
 
         if len(parts) > 1:
-            self.ensure_package(str(Path(*parts[:-1])))
+            pkg_parts = Path(*parts[:-1])
+            pkg_dir = str(base / pkg_parts) if base else str(pkg_parts)
+            self.ensure_package(pkg_dir)
 
         leaf_filename = parts[-1] + ".py"
-        if len(parts) > 1:
-            leaf_path = project_root / Path(*parts[:-1]) / leaf_filename
-        else:
-            leaf_path = project_root / leaf_filename
+        leaf_parts = (
+            Path(*parts[:-1]) / leaf_filename if len(parts) > 1 else Path(leaf_filename)
+        )
+        leaf_path = (
+            project_root / base / leaf_parts if base else project_root / leaf_parts
+        )
 
         if not leaf_path.exists():
             leaf_path.touch()
-            self._scaffolded_files.append(leaf_path)
+            self._scaffolded_modules.append(leaf_path)
             self.project.validate()
             print(f"  Created module: {leaf_path.relative_to(project_root)}")
 
         return leaf_path
 
-    def cleanup_scaffolding(self) -> None:
-        """Remove scaffolded __init__.py files and empty directories."""
-        for f in reversed(self._scaffolded_files):
+    def cleanup_scaffolding(self, *, keep_modules: bool = False) -> None:
+        """Remove scaffolded files and empty directories.
+
+        Always removes __init__.py files and empty directories.
+        Only removes leaf module files when keep_modules is False — on
+        real applies rope has written content into them.
+        """
+        if not keep_modules:
+            for f in reversed(self._scaffolded_modules):
+                if f.exists():
+                    f.unlink()
+        self._scaffolded_modules.clear()
+        for f in reversed(self._scaffolded_inits):
             if f.exists():
                 f.unlink()
-        self._scaffolded_files.clear()
+        self._scaffolded_inits.clear()
         for d in reversed(self._scaffolded_dirs):
             if d.exists() and not any(d.iterdir()):
                 d.rmdir()
@@ -412,6 +469,12 @@ class RefactorContext:
             verbose: If True, print each changeset being undone.
         """
         to_undo = len(self.project.history.undo_list) - self._checkpoint
+        if verbose:
+            print(
+                f"  Undo: {to_undo} change(s) to undo "
+                f"(history={len(self.project.history.undo_list)}, "
+                f"checkpoint={self._checkpoint})"
+            )
         if to_undo <= 0:
             self.cleanup_scaffolding()
             return
@@ -564,6 +627,9 @@ def run(
     show_diff = args.diff
 
     project = Project(str(project_root))
+    project.prefs.set(
+        "max_history_items", 10_000
+    )  # ensure dry-run can undo all changes
     ctx = RefactorContext(project=project, args=args, dry_run=dry_run)
 
     if ctx._state_hash:
@@ -588,12 +654,12 @@ def run(
         print("No changes needed.")
     elif dry_run:
         _print_changes(ctx._diffs, show_diff)
-        ctx.undo_all()
+        ctx.undo_all(verbose=True)
         _verify_snapshot(snapshot, "after dry-run undo")
         print()
         print("To apply, re-run without --diff/--dry-run.")
     else:
-        ctx.cleanup_scaffolding()
+        ctx.cleanup_scaffolding(keep_modules=True)
         _print_changes(ctx._diffs, show_diff=False, applied=True)
 
     project.close()

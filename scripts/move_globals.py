@@ -32,6 +32,12 @@ def setup_args(parser: ArgumentParser) -> None:
     parser.add_argument("source", type=Path, help="Source file containing the symbols")
     parser.add_argument("dest", type=str, help="Destination dotted module name")
     parser.add_argument("symbols", nargs="+", help="Symbols to move")
+    parser.add_argument(
+        "--source-root",
+        type=Path,
+        default=None,
+        help="Source folder relative to project root (e.g. src). Auto-detected if omitted.",
+    )
 
 
 def _find_offset(project, resource, symbol: str) -> tuple[int, int] | None:
@@ -108,7 +114,7 @@ def refactor(ctx: RefactorContext) -> None:
         raise ValueError(f"Cannot move from {ctx.args.source}: {', '.join(missing)}")
 
     # Resolve destination module, creating it and parent packages if needed
-    dest_file = ctx.ensure_module(ctx.args.dest)
+    dest_file = ctx.ensure_module(ctx.args.dest, source_root=ctx.args.source_root)
 
     for symbol in ctx.args.symbols:
         # Remove stale import of this symbol from destination before moving

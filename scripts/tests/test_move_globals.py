@@ -21,6 +21,7 @@ def test_apply(tmp_path: Path) -> None:
             source=project / "myapp/models.py",
             dest="myapp.utils",
             symbols=["DeviceStatus"],
+            source_root=None,
             dry_run=False,
             diff=False,
         ),

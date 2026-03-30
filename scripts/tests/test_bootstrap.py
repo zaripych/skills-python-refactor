@@ -59,6 +59,7 @@ def test_move_globals_dry_run_preserves_state(tmp_path: Path) -> None:
             source=project / "myapp/models.py",
             dest="myapp.utils",
             symbols=["DeviceStatus"],
+            source_root=None,
             dry_run=False,
             diff=True,
         ),

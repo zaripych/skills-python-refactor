@@ -31,6 +31,7 @@ def test_move_global_in_idiomatic_layout(tmp_path: Path) -> None:
             source=project / "src/myapp/models.py",
             symbols=["DeviceInfo"],
             dest="myapp.handlers.status",
+            source_root=None,
             dry_run=False,
             diff=False,
         ),
@@ -53,6 +54,36 @@ def test_move_global_in_idiomatic_layout(tmp_path: Path) -> None:
     status = (project / "src/myapp/handlers/status.py").read_text()
     assert "class DeviceInfo:" in status
     assert "def handle_status(device: DeviceInfo)" in status
+
+
+def test_move_global_to_new_module_scaffolds_under_src(tmp_path: Path) -> None:
+    """Moving to a brand-new module should scaffold under src/, not project root."""
+    project = instantiate_project_from_fixture("fixture-idiomatic-layout", tmp_path)
+
+    run(
+        move_globals.refactor,
+        args=Namespace(
+            project_root=project,
+            source=project / "src/myapp/models.py",
+            symbols=["DeviceInfo"],
+            dest="myapp.features.new_mod",
+            source_root=None,
+            dry_run=False,
+            diff=False,
+        ),
+    )
+
+    _assert_no_src_prefix(project)
+
+    # New module must be under src/, not at project root
+    assert (project / "src/myapp/features/new_mod.py").exists()
+    assert not (project / "myapp").exists(), (
+        "scaffolded at project root instead of src/"
+    )
+
+    # Destination should contain the moved symbol
+    new_mod = (project / "src/myapp/features/new_mod.py").read_text()
+    assert "class DeviceInfo:" in new_mod
 
 
 def test_move_module_in_idiomatic_layout(tmp_path: Path) -> None:
