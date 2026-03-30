@@ -1,6 +1,6 @@
 ---
 name: python-refactor
-description: Perform AST-aware Python refactors using the rope library. Handles parameter annotations, import management, rename, move, and custom source transformations with precise offset edits. Triggers: "add type annotations", "refactor with rope", "python refactor skill", "python refactor tool", "add imports", "rename across files", "annotate parameters", or needs AST-aware Python source code transformation.
+description: Perform AST-aware Python refactors using the rope library. Handles parameter annotations, import management, rename, move, de-re-export, relative-to-absolute import conversion, and custom source transformations with precise offset edits. Triggers: "add type annotations", "refactor with rope", "python refactor skill", "python refactor tool", "add imports", "rename across files", "annotate parameters", "remove re-exports", "de-export", "absolutize imports", "relative to absolute", or needs AST-aware Python source code transformation.
 ---
 
 # Python Refactor
@@ -18,6 +18,8 @@ Rope must be a dev dependency: `uv add --dev rope`
 | Same param name across **>3 files**   | Rope script (batch, safe)                       |
 | ≤3 files, any number of occurrences   | Direct Edit tool (faster, no script overhead)   |
 | Add/remove/reorganize imports in bulk | Rope (`ModuleImports` handles dedup, placement) |
+| Remove `__init__.py` re-exports       | Rope (`deexport.py` — resolves + rewrites)      |
+| Convert relative to absolute imports  | Rope (`absolutize.py` — batch conversion)        |
 | Rename symbol across files            | Rope (resolves all references)                  |
 | Simple literal string replacement     | Regex is fine                                   |
 | Non-Python files                      | Regex                                           |
@@ -240,6 +242,53 @@ The destination module and intermediate packages are created automatically if th
 
 **Undo/redo:** Each refactor run is tagged with a state hash. Use `refactor_history.py undo` to reverse the most recent run, or `refactor_history.py redo` to reapply a previously undone run.
 
+## Removing re-exports from `__init__.py`
+
+**Prefer reusing `deexport`** to eliminate re-exports. It resolves each re-exported symbol to its defining module, rewrites all callers to import directly from the source, then removes the re-export lines from `__init__.py`:
+
+```bash
+# De-export all re-exported symbols from a package
+uv run python scripts/deexport.py \
+    --diff \
+    src/pkg/handlers/
+
+# De-export only specific symbols
+uv run python scripts/deexport.py \
+    --diff \
+    src/pkg/handlers/ StatusCommand DeviceInfo
+```
+
+Parameters:
+
+- `package_path` — path to `__init__.py` or its parent directory
+- `symbols` — optional list of specific symbols to de-export (all re-exports if omitted)
+
+The script:
+1. Parses `__init__.py` to build a map of re-exported symbol → source module (via `ImportedName.get_definition_location()`)
+2. Finds all callers via rope's `find_occurrences` (catches both absolute and relative imports)
+3. Rewrites callers to import from the source module directly
+4. Removes the re-export lines from `__init__.py` and cleans up `__all__`
+
+Re-exported names that are also used locally in `__init__.py` (e.g. referenced in function bodies) are kept as imports but still de-exported from the public API. Handles aliased imports, mixed imports, nested packages, and relative imports pointing to the package.
+
+## Converting relative imports to absolute
+
+**Prefer reusing `absolutize`** to convert relative imports to absolute. Only touches explicit relative imports (`from .foo import bar`, `from ..models import X`) — absolute imports are never modified:
+
+```bash
+# Convert all relative imports in the project
+uv run python scripts/absolutize.py --diff
+
+# Convert only specific files or directories
+uv run python scripts/absolutize.py --diff src/pkg/models.py src/pkg/handlers/
+```
+
+Parameters:
+
+- `paths` — optional files or directories to process (all project `.py` files if omitted)
+
+Resolves the absolute module name from the resource path relative to source folders, handling namespace packages (directories without `__init__.py`). Works across all source folders including `tests/`.
+
 ## Undo / Redo
 
 All changes applied via `ctx.do()` are tracked through rope's history with state hash tagging. A single script manages both undo and redo:
@@ -287,8 +336,10 @@ Searches from the project root. When `patterns` is provided, only files containi
 | [rope-api.md](rope-api.md)             | Full rope API reference (Rename, Move, Extract, etc.)                                            | Optional — for built-in refactorings           |
 | `move_module.py`                       | Move a module to a new directory, rewriting all imports. Supports `--rename`.                     | Run directly from CLI                          |
 | `move_globals.py`                      | Move global symbols between modules with stale import cleanup                                    | Run directly from CLI                          |
+| `deexport.py`                          | Remove re-exports from `__init__.py`, rewrite callers to import from source modules              | Run directly from CLI                          |
+| `absolutize.py`                        | Convert relative imports to absolute across files                                                | Run directly from CLI                          |
 | `refactor_history.py`                  | Undo/redo refactor runs by state hash (`undo` or `redo` subcommand)                              | Run after a refactor to reverse or reapply     |
 
 ## Keywords
 
-rope, refactor, python, AST, annotations, type annotations, imports, rename, move, source transformation, code modification
+rope, refactor, python, AST, annotations, type annotations, imports, rename, move, source transformation, code modification, re-export, deexport, absolutize, relative imports, __init__.py
