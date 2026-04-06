@@ -45,7 +45,7 @@ Each script has a companion `.md` file with the exact workflow to follow. **Read
 | ----------------------- | -------------------------------------------------------- | ---------------------------------------------------- |
 | `move_module.py`        | Move a module/package to a new directory                 | [move_module.md](move_module.md)                     |
 | `rename_module.py`      | Rename a module/package in place                         | [rename_module.md](rename_module.md)                 |
-| `rename_symbol.py`      | Rename a symbol across the project                       | [rename_symbol.md](rename_symbol.md)                 |
+| `rename_symbol.py`      | Rename a symbol (requires line number — read file first) | [rename_symbol.md](rename_symbol.md)                 |
 | `move_globals.py`       | Move globals between modules                             | [move_globals.md](move_globals.md)                   |
 | `module_to_package.py`  | Convert module to package, split globals into submodules | [module_to_package.md](module_to_package.md)         |
 | `deexport.py`           | Remove re-exports from `__init__.py`                     | [deexport.md](deexport.md)                           |
