@@ -38,17 +38,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
-import ast as stdlib_ast
-
 from rope.base.change import Change, ChangeContents, ChangeSet, MoveResource
-from rope.base.oi.type_hinting.factory import TypeHintingFactory
-from rope.base.oi.type_hinting.providers import (
-    composite as composite_providers,
-    inheritance,
-    interfaces as provider_interfaces,
-)
 from rope.base.project import Project
 from rope.base.resources import File
+
 
 # ---------------------------------------------------------------------------
 # PEP 484 annotation-aware type hinting for rope
@@ -57,31 +50,46 @@ from rope.base.resources import File
 # docstrings.  This subclass adds a provider that reads inline PEP 484
 # annotations (e.g. ``def f(x: MyClass)``), enabling rename/move refactors
 # to follow attribute access through annotated parameters.
+#
+# All rope.base.oi.type_hinting imports are deferred to avoid a circular
+# import that occurs when these modules are loaded before rope.base.project.
 
 
-class _AnnotationParamProvider(provider_interfaces.IParamProvider):
-    """Resolve parameter types from PEP 484 inline annotations."""
+def _build_annotation_aware_factory():
+    """Create the factory lazily to avoid circular imports at module level."""
+    import ast as stdlib_ast
 
-    def __init__(self, resolver):
-        self._resolve = resolver
+    from rope.base.oi.type_hinting.factory import TypeHintingFactory
+    from rope.base.oi.type_hinting.providers import (
+        composite as composite_providers,
+        inheritance,
+        interfaces as provider_interfaces,
+    )
 
-    def __call__(self, pyfunc, param_name):
-        for arg in pyfunc.get_ast().args.args:
-            if arg.arg == param_name and arg.annotation:
-                type_str = stdlib_ast.unparse(arg.annotation)
-                return self._resolve(type_str, pyfunc)
+    class _AnnotationParamProvider(provider_interfaces.IParamProvider):
+        """Resolve parameter types from PEP 484 inline annotations."""
+
+        def __init__(self, resolver):
+            self._resolve = resolver
+
+        def __call__(self, pyfunc, param_name):
+            for arg in pyfunc.get_ast().args.args:
+                if arg.arg == param_name and arg.annotation:
+                    type_str = stdlib_ast.unparse(arg.annotation)
+                    return self._resolve(type_str, pyfunc)
+
+    class _AnnotationAwareHintingFactory(TypeHintingFactory):
+        def make_param_provider(self):
+            base = super().make_param_provider()
+            annotation_provider = _AnnotationParamProvider(self.make_resolver())
+            return inheritance.ParamProvider(
+                composite_providers.ParamProvider(annotation_provider, base)
+            )
+
+    return _AnnotationAwareHintingFactory()
 
 
-class _AnnotationAwareHintingFactory(TypeHintingFactory):
-    def make_param_provider(self):
-        base = super().make_param_provider()
-        annotation_provider = _AnnotationParamProvider(self.make_resolver())
-        return inheritance.ParamProvider(
-            composite_providers.ParamProvider(annotation_provider, base)
-        )
-
-
-annotation_aware_type_hinting_factory = _AnnotationAwareHintingFactory()
+annotation_aware_type_hinting_factory = _build_annotation_aware_factory()
 
 # Prefix used to tag ChangeSet descriptions with a refactor run hash.
 # Format: [refactor:<8-char-hex>] <original description>
