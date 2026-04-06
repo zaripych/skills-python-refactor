@@ -13,7 +13,7 @@ references symbol A and both are being moved, list A first. Otherwise rope
 adds a temporary import of A from the source into the destination, which
 becomes stale once A moves and must be cleaned up.
 
-Supports --dry-run and --diff via the bootstrap.
+Supports --diff via the bootstrap.
 """
 
 import sys
@@ -112,6 +112,10 @@ def refactor(ctx: RefactorContext) -> None:
             missing.append(f"{s} (imported, not locally defined)")
     if missing:
         raise ValueError(f"Cannot move from {ctx.args.source}: {', '.join(missing)}")
+
+    # Ensure __init__.py exists for the source's own package and all packages
+    # it imports from, so rope's modname() can resolve full dotted paths.
+    ctx.ensure_packages(resource)
 
     # Resolve destination module, creating it and parent packages if needed
     dest_file = ctx.ensure_module(ctx.args.dest, source_root=ctx.args.source_root)

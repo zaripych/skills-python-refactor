@@ -6,11 +6,26 @@ from argparse import Namespace
 from pathlib import Path
 from textwrap import dedent
 
-from conftest import instantiate_project_from_fixture, snapshot_state
+from conftest import (
+    instantiate_project_from_fixture,
+    read_directory_structure_sorted,
+    snapshot_state,
+)
 
 import move_globals
 import move_module
 from rope_bootstrap import run
+
+BEFORE_STRUCTURE = [
+    "pyproject.toml",
+    "src/myapp/__init__.py",
+    "src/myapp/handlers/__init__.py",
+    "src/myapp/handlers/status.py",
+    "src/myapp/models.py",
+    "tests/test_models.py",
+    "tests/test_status.py",
+    "uv.lock",
+]
 
 
 def _assert_no_src_prefix(project: Path) -> None:
@@ -24,6 +39,26 @@ def _assert_no_src_prefix(project: Path) -> None:
 def test_move_global_in_idiomatic_layout(tmp_path: Path) -> None:
     project = instantiate_project_from_fixture("fixture-idiomatic-layout", tmp_path)
 
+    assert read_directory_structure_sorted(project) == BEFORE_STRUCTURE
+
+    assert (project / "src/myapp/models.py").read_text() == dedent("""\
+        from dataclasses import dataclass
+
+
+        @dataclass
+        class DeviceInfo:
+            name: str
+            address: str
+    """)
+
+    assert (project / "src/myapp/handlers/status.py").read_text() == dedent("""\
+        from myapp.models import DeviceInfo
+
+
+        def handle_status(device: DeviceInfo) -> str:
+            return device.name
+    """)
+
     run(
         move_globals.refactor,
         args=Namespace(
@@ -32,14 +67,34 @@ def test_move_global_in_idiomatic_layout(tmp_path: Path) -> None:
             symbols=["DeviceInfo"],
             dest="myapp.handlers.status",
             source_root=None,
-            dry_run=False,
             diff=False,
         ),
     )
 
     _assert_no_src_prefix(project)
 
-    # tests/test_models.py should be updated to import from the new location
+    assert read_directory_structure_sorted(project) == BEFORE_STRUCTURE
+
+    assert (project / "src/myapp/models.py").read_text() == ""
+
+    assert (project / "src/myapp/handlers/status.py").read_text() == dedent("""\
+        from dataclasses import dataclass
+
+
+        @dataclass
+        class DeviceInfo:
+            name: str
+            address: str
+        def handle_status(device: DeviceInfo) -> str:
+            return device.name
+    """)
+
+    assert (project / "src/myapp/handlers/__init__.py").read_text() == dedent("""\
+        from myapp.handlers.status import handle_status
+
+        __all__ = ["handle_status"]
+    """)
+
     assert (project / "tests/test_models.py").read_text() == dedent("""\
         from myapp.handlers.status import DeviceInfo
         def test_device_info():
@@ -47,18 +102,32 @@ def test_move_global_in_idiomatic_layout(tmp_path: Path) -> None:
             assert d.name == "a"
     """)
 
-    # Source module should be empty after moving the only symbol
-    assert (project / "src/myapp/models.py").read_text() == ""
+    assert (project / "tests/test_status.py").read_text() == dedent("""\
+        from myapp.handlers.status import handle_status
+        from myapp.handlers.status import DeviceInfo
 
-    # Destination should contain the moved symbol
-    status = (project / "src/myapp/handlers/status.py").read_text()
-    assert "class DeviceInfo:" in status
-    assert "def handle_status(device: DeviceInfo)" in status
+
+        def test_handle_status():
+            d = DeviceInfo(name="a", address="b")
+            assert handle_status(d) == "a"
+    """)
 
 
 def test_move_global_to_new_module_scaffolds_under_src(tmp_path: Path) -> None:
     """Moving to a brand-new module should scaffold under src/, not project root."""
     project = instantiate_project_from_fixture("fixture-idiomatic-layout", tmp_path)
+
+    assert read_directory_structure_sorted(project) == BEFORE_STRUCTURE
+
+    assert (project / "src/myapp/models.py").read_text() == dedent("""\
+        from dataclasses import dataclass
+
+
+        @dataclass
+        class DeviceInfo:
+            name: str
+            address: str
+    """)
 
     run(
         move_globals.refactor,
@@ -68,26 +137,84 @@ def test_move_global_to_new_module_scaffolds_under_src(tmp_path: Path) -> None:
             symbols=["DeviceInfo"],
             dest="myapp.features.new_mod",
             source_root=None,
-            dry_run=False,
             diff=False,
         ),
     )
 
     _assert_no_src_prefix(project)
 
-    # New module must be under src/, not at project root
-    assert (project / "src/myapp/features/new_mod.py").exists()
-    assert not (project / "myapp").exists(), (
-        "scaffolded at project root instead of src/"
-    )
+    assert read_directory_structure_sorted(project) == [
+        "pyproject.toml",
+        "src/myapp/__init__.py",
+        "src/myapp/features/new_mod.py",
+        "src/myapp/handlers/__init__.py",
+        "src/myapp/handlers/status.py",
+        "src/myapp/models.py",
+        "tests/test_models.py",
+        "tests/test_status.py",
+        "uv.lock",
+    ]
 
-    # Destination should contain the moved symbol
-    new_mod = (project / "src/myapp/features/new_mod.py").read_text()
-    assert "class DeviceInfo:" in new_mod
+    assert (project / "src/myapp/features/new_mod.py").read_text() == dedent("""\
+        from dataclasses import dataclass
+
+
+        @dataclass
+        class DeviceInfo:
+            name: str
+            address: str
+    """)
+
+    assert (project / "src/myapp/models.py").read_text() == ""
+
+    assert (project / "src/myapp/handlers/status.py").read_text() == dedent("""\
+        from myapp.features.new_mod import DeviceInfo
+        def handle_status(device: DeviceInfo) -> str:
+            return device.name
+    """)
+
+    assert (project / "src/myapp/handlers/__init__.py").read_text() == dedent("""\
+        from myapp.handlers.status import handle_status
+
+        __all__ = ["handle_status"]
+    """)
+
+    assert (project / "tests/test_models.py").read_text() == dedent("""\
+        from myapp.features.new_mod import DeviceInfo
+        def test_device_info():
+            d = DeviceInfo(name="a", address="b")
+            assert d.name == "a"
+    """)
+
+    assert (project / "tests/test_status.py").read_text() == dedent("""\
+        from myapp.handlers.status import handle_status
+        from myapp.features.new_mod import DeviceInfo
+
+
+        def test_handle_status():
+            d = DeviceInfo(name="a", address="b")
+            assert handle_status(d) == "a"
+    """)
 
 
 def test_move_module_in_idiomatic_layout(tmp_path: Path) -> None:
     project = instantiate_project_from_fixture("fixture-idiomatic-layout", tmp_path)
+
+    assert read_directory_structure_sorted(project) == BEFORE_STRUCTURE
+
+    assert (project / "src/myapp/handlers/status.py").read_text() == dedent("""\
+        from myapp.models import DeviceInfo
+
+
+        def handle_status(device: DeviceInfo) -> str:
+            return device.name
+    """)
+
+    assert (project / "src/myapp/handlers/__init__.py").read_text() == dedent("""\
+        from myapp.handlers.status import handle_status
+
+        __all__ = ["handle_status"]
+    """)
 
     run(
         move_module.refactor,
@@ -96,12 +223,22 @@ def test_move_module_in_idiomatic_layout(tmp_path: Path) -> None:
             source=project / "src/myapp/handlers/status.py",
             dest_dir="src/myapp/features",
             rename="handler",
-            dry_run=False,
             diff=False,
         ),
     )
 
     _assert_no_src_prefix(project)
+
+    assert read_directory_structure_sorted(project) == [
+        "pyproject.toml",
+        "src/myapp/__init__.py",
+        "src/myapp/features/handler.py",
+        "src/myapp/handlers/__init__.py",
+        "src/myapp/models.py",
+        "tests/test_models.py",
+        "tests/test_status.py",
+        "uv.lock",
+    ]
 
     assert (project / "src/myapp/features/handler.py").read_text() == dedent("""\
         from myapp.models import DeviceInfo
@@ -117,6 +254,16 @@ def test_move_module_in_idiomatic_layout(tmp_path: Path) -> None:
         __all__ = ["handle_status"]
     """)
 
+    assert (project / "tests/test_status.py").read_text() == dedent("""\
+        from myapp.features.handler import handle_status
+        from myapp.models import DeviceInfo
+
+
+        def test_handle_status():
+            d = DeviceInfo(name="a", address="b")
+            assert handle_status(d) == "a"
+    """)
+
 
 def test_move_module_dry_run_in_idiomatic_layout(tmp_path: Path) -> None:
     project = instantiate_project_from_fixture("fixture-idiomatic-layout", tmp_path)
@@ -129,7 +276,76 @@ def test_move_module_dry_run_in_idiomatic_layout(tmp_path: Path) -> None:
             source=project / "src/myapp/handlers/status.py",
             dest_dir="src/myapp/features",
             rename="handler",
-            dry_run=False,
+            diff=True,
+        ),
+    )
+
+    assert before == snapshot_state(project)
+
+
+def test_move_test_to_src_with_rename(tmp_path: Path) -> None:
+    """Move a test file from tests/ into src/ with rename."""
+    project = instantiate_project_from_fixture("fixture-idiomatic-layout", tmp_path)
+
+    assert read_directory_structure_sorted(project) == BEFORE_STRUCTURE
+
+    assert (project / "tests/test_status.py").read_text() == dedent("""\
+        from myapp.handlers.status import handle_status
+        from myapp.models import DeviceInfo
+
+
+        def test_handle_status():
+            d = DeviceInfo(name="a", address="b")
+            assert handle_status(d) == "a"
+    """)
+
+    run(
+        move_module.refactor,
+        args=Namespace(
+            project_root=project,
+            source=project / "tests/test_status.py",
+            dest_dir="src/myapp/features",
+            rename="cli_test",
+            diff=False,
+        ),
+    )
+
+    _assert_no_src_prefix(project)
+
+    assert read_directory_structure_sorted(project) == [
+        "pyproject.toml",
+        "src/myapp/__init__.py",
+        "src/myapp/features/cli_test.py",
+        "src/myapp/handlers/__init__.py",
+        "src/myapp/handlers/status.py",
+        "src/myapp/models.py",
+        "tests/test_models.py",
+        "uv.lock",
+    ]
+
+    assert (project / "src/myapp/features/cli_test.py").read_text() == dedent("""\
+        from myapp.handlers.status import handle_status
+        from myapp.models import DeviceInfo
+
+
+        def test_handle_status():
+            d = DeviceInfo(name="a", address="b")
+            assert handle_status(d) == "a"
+    """)
+
+
+def test_move_test_to_src_diff_is_undone(tmp_path: Path) -> None:
+    """Dry-run of a pure move (no import changes) must not alter the tree."""
+    project = instantiate_project_from_fixture("fixture-idiomatic-layout", tmp_path)
+    before = snapshot_state(project)
+
+    run(
+        move_module.refactor,
+        args=Namespace(
+            project_root=project,
+            source=project / "tests/test_status.py",
+            dest_dir="src/myapp/features",
+            rename="cli_test",
             diff=True,
         ),
     )

@@ -1,6 +1,6 @@
 # Writing Custom Refactor Scripts
 
-All refactor scripts MUST use [scripts/rope_bootstrap.py](scripts/rope_bootstrap.py). It provides project setup, `--dry-run`, `--diff`, git safety checks, and the `RefactorContext` with file selection helpers.
+All refactor scripts MUST use [scripts/rope_bootstrap.py](scripts/rope_bootstrap.py). It provides project setup, `--diff` preview mode, git safety checks, and the `RefactorContext` with file selection helpers.
 
 ## Script template
 
@@ -37,18 +37,31 @@ if __name__ == "__main__":
 The bootstrap provides these flags automatically — no need to add them:
 
 - `--project-root` (optional) — rope project root (defaults to git repository root)
-- `--dry-run` — show what would change without modifying files
-- `--diff` — show unified diff (implies `--dry-run`)
+- `--diff` — show unified diff without applying changes
 
 Each refactor script adds its own args via `setup_args`. Access all parsed args through `ctx.args`.
 
-**Always run with `--dry-run` first**, then apply.
+**Always run with `--diff` first**, then apply.
 
 ## RefactorContext API
 
 ### File selection
 
-Use `ctx.find_files()` for file selection — see SKILL.md for usage and parameters.
+Use `ctx.find_files()` to select files. It combines glob matching with optional text pre-filtering (via ripgrep, falling back to grep):
+
+```python
+# All .py files in the project
+files = ctx.find_files()
+
+# Only files containing "cmd" or "send", filtered by globs
+files = ctx.find_files(
+    patterns={"cmd", "send"},
+    include=["tests/**/*.py"],
+    exclude=["conftest.py"],
+)
+```
+
+Searches from the project root. When `patterns` is provided, only files containing a match are included. The result is always intersected with include/exclude globs. Logs which tool was used, how many files matched, and how many were excluded.
 
 ### Reading and writing
 
@@ -70,7 +83,7 @@ Each `ctx.do()` call writes to disk immediately through `project.do()` and tags 
 ```python
 ctx.project           # the rope Project instance
 ctx.args              # parsed CLI args (bootstrap + script-specific)
-ctx.dry_run           # True if --dry-run or --diff
+ctx.dry_run           # True if --diff
 ```
 
 ## Rename, move, and other built-in refactorings

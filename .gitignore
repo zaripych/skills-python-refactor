@@ -1,4 +1,16 @@
+# Python-generated files
 __pycache__/
-.pytest_cache/
-scripts/.venv/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.ropeproject
+.ruff_cache
+.pytest_cache
+
+# Coverage
 .coverage
+
+# Virtual environments
+.venv

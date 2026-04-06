@@ -9,7 +9,7 @@ Usage:
         --project-root /path/to/project \\
         pendant/  [SYMBOL1 SYMBOL2 ...]
 
-Supports --dry-run and --diff via the bootstrap.
+Supports --diff via the bootstrap.
 """
 
 import ast

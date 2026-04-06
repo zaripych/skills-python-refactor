@@ -32,7 +32,6 @@ def test_undo_after_move_globals(
             dest="myapp.utils",
             symbols=["DeviceStatus"],
             source_root=None,
-            dry_run=False,
             diff=False,
         ),
     )
@@ -54,7 +53,6 @@ def test_redo_after_undo(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> 
             dest="myapp.utils",
             symbols=["DeviceStatus"],
             source_root=None,
-            dry_run=False,
             diff=False,
         ),
     )
@@ -83,7 +81,6 @@ def test_undo_after_move_module(
             source=project / "myapp/handlers/status.py",
             dest_dir="myapp/features",
             rename="handler",
-            dry_run=False,
             diff=False,
         ),
     )
@@ -107,23 +104,18 @@ def test_list_then_undo(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> N
             dest="myapp.utils",
             symbols=["DeviceStatus"],
             source_root=None,
-            dry_run=False,
             diff=False,
         ),
     )
     capsys.readouterr()  # clear output from refactor
 
     # List should show the refactor run
-    refactor_history.main(
-        Namespace(action="undo", project_root=project, hash=None, list=True)
-    )
+    refactor_history.main(Namespace(action="list", project_root=project, hash=None))
     list_output = capsys.readouterr().out
     assert "changeset(s)" in list_output
 
     # Undo should restore original state
-    refactor_history.main(
-        Namespace(action="undo", project_root=project, hash=None, list=False)
-    )
+    refactor_history.main(Namespace(action="undo", project_root=project, hash=None))
     assert "Undone" in capsys.readouterr().out
     assert before == snapshot_state(project)
 
@@ -136,7 +128,6 @@ def test_parse_undo() -> None:
     assert args.action == "undo"
     assert args.project_root is None
     assert args.hash is None
-    assert args.list is False
 
 
 def test_parse_redo_with_hash() -> None:
@@ -148,7 +139,6 @@ def test_parse_redo_with_hash() -> None:
     assert args.project_root == Path("/tmp/proj")
 
 
-def test_parse_undo_list() -> None:
-    args = refactor_history.build_parser().parse_args(["undo", "--list"])
-    assert args.action == "undo"
-    assert args.list is True
+def test_parse_list() -> None:
+    args = refactor_history.build_parser().parse_args(["list"])
+    assert args.action == "list"

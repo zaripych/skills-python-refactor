@@ -1,6 +1,6 @@
 """Bootstrap for rope refactor scripts.
 
-Handles project setup, dry-run mode, and diff output.
+Handles project setup, diff preview mode, and change output.
 Every refactor script imports this and calls `run()` with a refactor function.
 
 Usage in refactor scripts:
@@ -31,15 +31,57 @@ import os
 import shutil
 import subprocess
 import sys
+import tomllib
 from argparse import ArgumentParser, Namespace
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
+import ast as stdlib_ast
+
 from rope.base.change import Change, ChangeContents, ChangeSet, MoveResource
+from rope.base.oi.type_hinting.factory import TypeHintingFactory
+from rope.base.oi.type_hinting.providers import (
+    composite as composite_providers,
+    inheritance,
+    interfaces as provider_interfaces,
+)
 from rope.base.project import Project
 from rope.base.resources import File
+
+# ---------------------------------------------------------------------------
+# PEP 484 annotation-aware type hinting for rope
+# ---------------------------------------------------------------------------
+# Rope's built-in TypeHintingFactory only resolves parameter types from
+# docstrings.  This subclass adds a provider that reads inline PEP 484
+# annotations (e.g. ``def f(x: MyClass)``), enabling rename/move refactors
+# to follow attribute access through annotated parameters.
+
+
+class _AnnotationParamProvider(provider_interfaces.IParamProvider):
+    """Resolve parameter types from PEP 484 inline annotations."""
+
+    def __init__(self, resolver):
+        self._resolve = resolver
+
+    def __call__(self, pyfunc, param_name):
+        for arg in pyfunc.get_ast().args.args:
+            if arg.arg == param_name and arg.annotation:
+                type_str = stdlib_ast.unparse(arg.annotation)
+                return self._resolve(type_str, pyfunc)
+
+
+class _AnnotationAwareHintingFactory(TypeHintingFactory):
+    def make_param_provider(self):
+        base = super().make_param_provider()
+        annotation_provider = _AnnotationParamProvider(self.make_resolver())
+        return inheritance.ParamProvider(
+            composite_providers.ParamProvider(annotation_provider, base)
+        )
+
+
+annotation_aware_type_hinting_factory = _AnnotationAwareHintingFactory()
 
 # Prefix used to tag ChangeSet descriptions with a refactor run hash.
 # Format: [refactor:<8-char-hex>] <original description>
@@ -135,6 +177,23 @@ class GitSnapshot:
         return []
 
 
+def _is_dir_empty(path: Path) -> bool:
+    """Check if a directory is empty, ignoring __pycache__."""
+    children = list(path.iterdir())
+    return not children or all(c.name == "__pycache__" for c in children)
+
+
+def _rm_empty_dir(path: Path) -> bool:
+    """Remove a directory if empty (ignoring __pycache__). Returns True if removed."""
+    if not path.exists() or not _is_dir_empty(path):
+        return False
+    pycache = path / "__pycache__"
+    if pycache.exists():
+        shutil.rmtree(pycache)
+    path.rmdir()
+    return True
+
+
 def _compute_state_hash(project_root: Path) -> str:
     """Compute a hash identifying the current codebase state.
 
@@ -213,6 +272,10 @@ class RefactorContext:
         (e.g. ``src/`` would produce ``src.myapp.x`` imports).
         """
         project_root = Path(self.project.root.real_path)
+        resolved = (project_root / dest_dir).resolve()
+        assert resolved.is_relative_to(project_root), (
+            f"ensure_package refusing to create __init__.py outside project root: {resolved}"
+        )
         source_folders = {sf.path for sf in self.project.get_source_folders()}
         parts = Path(dest_dir).parts
 
@@ -223,7 +286,7 @@ class RefactorContext:
             if not full.exists():
                 full.mkdir()
                 self._scaffolded_dirs.append(full)
-                print(f"  Created directory: {current}")
+                print(f"  Scaffolded directory: {current}")
 
             if str(current) in source_folders:
                 continue
@@ -232,9 +295,81 @@ class RefactorContext:
             if not init.exists():
                 init.touch()
                 self._scaffolded_inits.append(init)
-                print(f"  Created __init__.py: {current / '__init__.py'}")
+                print(f"  Scaffolded __init__.py: {current / '__init__.py'}")
 
         self.project.validate()
+
+    def _package_dirs_for(self, resource: File) -> list[Path]:
+        """Return absolute directory paths that need __init__.py for rope to resolve imports.
+
+        Includes the file's own parent package chain and the parent chains of
+        all project-internal modules it imports from.  Every returned path is
+        guaranteed to be absolute and inside the project root.
+        """
+        project_root = Path(self.project.root.real_path)
+        candidates: list[str] = []
+
+        own_parent = str(Path(resource.path).parent)
+        if own_parent != ".":
+            candidates.append(own_parent)
+
+        pymodule = self.project.get_pymodule(resource)
+        for name in pymodule.get_scope().get_defined_names():
+            pyname = pymodule.get_scope()[name]
+            module_info = getattr(pyname, "get_definition_location", None)
+            if module_info is None:
+                continue
+            definition_module, _ = module_info()
+            if definition_module is None:
+                continue
+            dep_resource = definition_module.get_resource()
+            if dep_resource is None or dep_resource == resource:
+                continue
+            parent = str(Path(dep_resource.path).parent)
+            if parent != ".":
+                candidates.append(parent)
+
+        source_folders = [
+            Path(sf.real_path) for sf in self.project.get_source_folders()
+        ]
+        dirs: list[Path] = []
+        for candidate in candidates:
+            absolute = (project_root / candidate).resolve()
+            if not absolute.is_relative_to(project_root):
+                continue
+            if not any(absolute.is_relative_to(sf) for sf in source_folders):
+                continue
+            dirs.append(absolute)
+
+        return dirs
+
+    def ensure_packages(self, resource: "File | Folder") -> None:
+        """Ensure __init__.py exists for a file's own package and all imported packages.
+
+        Rope's ``modname()`` walks parent directories only while each has
+        ``__init__.py``. Without this, moves/renames produce truncated bare
+        imports like ``from transport import X`` instead of
+        ``from pkg.sub.transport import X``.
+
+        Accepts a File or a Folder (package). For folders, scans every .py
+        file in the package tree.
+        """
+        if resource.is_folder():
+            files = [
+                r
+                for r in self.project.get_python_files()
+                if r.path.startswith(resource.path + "/") or r.path == resource.path
+            ]
+        else:
+            files = [resource]
+
+        project_root = Path(self.project.root.real_path)
+        seen: set[Path] = set()
+        for f in files:
+            for pkg_dir in self._package_dirs_for(f):
+                if pkg_dir not in seen:
+                    seen.add(pkg_dir)
+                    self.ensure_package(str(pkg_dir.relative_to(project_root)))
 
     def _resolve_source_root(
         self, dotted_name: str, source_root: Path | None
@@ -284,12 +419,21 @@ class RefactorContext:
             source_root: Source folder relative to project root (e.g. Path("src")).
                 If None, resolved automatically from rope's source folders.
         """
-        dest_resource = self.project.find_module(dotted_name)
-        if dest_resource is not None:
-            return Path(self.project.root.real_path) / dest_resource.path
-
         project_root = Path(self.project.root.real_path)
         parts = dotted_name.split(".")
+
+        dest_resource = self.project.find_module(dotted_name)
+        if dest_resource is not None:
+            # Module exists, but parent directories may lack __init__.py.
+            # Without them rope can't resolve the full package path and
+            # generates broken bare imports (e.g. ``from ble import X``
+            # instead of ``from pendant.daemon.status.ble import X``).
+            if len(parts) > 1:
+                dest_path = Path(dest_resource.path)
+                pkg_dir = str(dest_path.parent)
+                self.ensure_package(pkg_dir)
+            return project_root / dest_resource.path
+
         base = self._resolve_source_root(dotted_name, source_root)
 
         if len(parts) > 1:
@@ -309,7 +453,7 @@ class RefactorContext:
             leaf_path.touch()
             self._scaffolded_modules.append(leaf_path)
             self.project.validate()
-            print(f"  Created module: {leaf_path.relative_to(project_root)}")
+            print(f"  Scaffolded module: {leaf_path.relative_to(project_root)}")
 
         return leaf_path
 
@@ -320,19 +464,33 @@ class RefactorContext:
         Only removes leaf module files when keep_modules is False — on
         real applies rope has written content into them.
         """
+        project_root = Path(self.project.root.real_path)
+        removed: list[str] = []
         if not keep_modules:
             for f in reversed(self._scaffolded_modules):
                 if f.exists():
                     f.unlink()
+                    removed.append(str(f.relative_to(project_root)))
         self._scaffolded_modules.clear()
         for f in reversed(self._scaffolded_inits):
             if f.exists():
                 f.unlink()
+                removed.append(str(f.relative_to(project_root)))
         self._scaffolded_inits.clear()
-        for d in reversed(self._scaffolded_dirs):
-            if d.exists() and not any(d.iterdir()):
-                d.rmdir()
+        # Also consider parent directories of removed files — they may now be
+        # empty (e.g. rope's ModuleToPackage undo couldn't remove the directory
+        # because scaffolded files were still present at undo time).
+        dirs_to_check: list[Path] = list(reversed(self._scaffolded_dirs))
+        for rel in removed:
+            parent = (project_root / rel).parent
+            if parent != project_root and parent not in self._scaffolded_dirs:
+                dirs_to_check.append(parent)
+        for d in dirs_to_check:
+            if _rm_empty_dir(d):
+                removed.append(str(d.relative_to(project_root)))
         self._scaffolded_dirs.clear()
+        if removed:
+            print(f"  Cleaned up scaffolding: {', '.join(removed)}")
         self.project.validate()
 
     def find_files(
@@ -443,21 +601,51 @@ class RefactorContext:
                     print(f"  Warning: could not read {leaf.resource.path}: {e}")
                     snapshots[leaf.resource.path] = ""
 
+        # Ensure files targeted by MoveResource are tracked by git so that
+        # rope's GITCommands.move() (which uses `git mv`) doesn't silently
+        # fail, leaving the file unmoved on disk.
+        if moves:
+            self._git_track_for_moves(moves)
+
         self.project.do(changes)
 
         # Record diffs
         for path, original in snapshots.items():
             actual_path = moves.get(path, path)
+            # If a parent directory was moved, resolve the new path
+            if actual_path == path:
+                p = Path(path)
+                for old_dir, new_dir in moves.items():
+                    try:
+                        rel = p.relative_to(old_dir)
+                    except ValueError:
+                        continue
+                    actual_path = str(Path(new_dir) / rel)
+                    break
             resource = self.project.get_resource(actual_path)
             self._diffs.append(
                 FileDiff(
                     path=path,
                     original=original,
                     new_source=resource.read(),
-                    new_path=moves.get(path),
+                    new_path=actual_path if actual_path != path else None,
                     step=self._step,
                 )
             )
+        # Record pure moves (no content change) so they appear in diffs
+        for old_path, new_path in moves.items():
+            if old_path not in snapshots:
+                resource = self.project.get_resource(new_path)
+                content = "" if resource.is_folder() else resource.read()
+                self._diffs.append(
+                    FileDiff(
+                        path=old_path,
+                        original=content,
+                        new_source=content,
+                        new_path=new_path,
+                        step=self._step,
+                    )
+                )
 
     def undo_all(self, *, drop: bool = False, verbose: bool = False) -> None:
         """Undo all changes back to the checkpoint, then remove scaffolding.
@@ -488,6 +676,52 @@ class RefactorContext:
             if verbose:
                 print(f"  [{undone}/{to_undo}] Undone: {desc}")
         self.cleanup_scaffolding()
+
+    def _git_track_for_moves(self, moves: dict[str, str]) -> None:
+        """Ensure source paths of MoveResource are git-tracked.
+
+        Rope's GITCommands.move() uses ``git mv`` which silently fails for
+        untracked files — the file never moves on disk.  By ``git add``-ing
+        untracked sources first, ``git mv`` succeeds.
+        """
+        project_path = Path(self.project.address)
+        git_root = _git_repo_root(project_path)
+        if git_root is None:
+            return
+
+        # Ask git which of the source paths are untracked
+        abs_sources = []
+        for src in moves:
+            abs_path = project_path / src
+            if abs_path.exists():
+                abs_sources.append(str(abs_path))
+        if not abs_sources:
+            return
+
+        result = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", "--"] + abs_sources,
+            capture_output=True,
+            text=True,
+            cwd=git_root,
+        )
+        if result.returncode == 0:
+            return  # all tracked
+
+        # Some files are untracked — add them so git mv works
+        # Use ls-files --others to find exactly which ones
+        result = subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard", "--"] + abs_sources,
+            capture_output=True,
+            text=True,
+            cwd=git_root,
+        )
+        untracked = [line for line in result.stdout.splitlines() if line.strip()]
+        if untracked:
+            subprocess.run(
+                ["git", "add", "--"] + untracked,
+                capture_output=True,
+                cwd=git_root,
+            )
 
     def _iter_changes(self, changes: Change) -> list[Change]:
         """Flatten a Change tree into leaf changes."""
@@ -552,10 +786,8 @@ def _print_changes(
 
     if applied:
         print(f"Applied {total} change(s):")
-    elif show_diff:
-        print(f"Would apply {total} change(s):")
     else:
-        print(f"[dry-run] Would apply {total} change(s):")
+        print(f"Would apply {total} change(s):")
 
     prev_step = 0
     for diff in diffs:
@@ -597,14 +829,9 @@ def build_parser(
         help="Rope project root (default: git repository root)",
     )
     parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Show what would change without modifying files",
-    )
-    parser.add_argument(
         "--diff",
         action="store_true",
-        help="Show unified diff of changes (implies --dry-run)",
+        help="Show unified diff of changes without applying",
     )
     if setup_args:
         setup_args(parser)
@@ -623,13 +850,49 @@ def run(
         args = build_parser(description, setup_args).parse_args()
 
     project_root = resolve_project_root(args.project_root)
-    dry_run = args.dry_run or args.diff
+    dry_run = args.diff
     show_diff = args.diff
 
     project = Project(str(project_root))
-    project.prefs.set(
-        "max_history_items", 10_000
-    )  # ensure dry-run can undo all changes
+
+    # Use annotation-aware type hinting so rope resolves PEP 484 parameter
+    # annotations (e.g. `def f(x: MyClass)`) for rename/move refactors.
+    # Only override if the user hasn't configured a custom factory.
+    _default_thf = "rope.base.oi.type_hinting.factory.default_type_hinting_factory"
+    if project.prefs.get("type_hinting_factory", _default_thf) == _default_thf:
+        project.prefs.set(
+            "type_hinting_factory",
+            "rope_bootstrap.annotation_aware_type_hinting_factory",
+        )
+
+    # Read [tool.rope] from pyproject.toml to respect explicit project overrides.
+    pyproject = project_root / "pyproject.toml"
+    if pyproject.exists():
+        rope_cfg = tomllib.loads(pyproject.read_text()).get("tool", {}).get("rope", {})
+    else:
+        rope_cfg = {}
+
+    # Dry-run undo needs all changes in history; rope's default (32) is too low.
+    rope_max_history = rope_cfg.get("max_history_items")
+    if rope_max_history is None:
+        project.prefs.set("max_history_items", 10_000)
+    elif rope_max_history <= 32:
+        print(
+            f"Warning: [tool.rope] max_history_items = {rope_max_history} may be"
+            " too low for batch refactors with dry-run undo (default override: 10000)"
+        )
+
+    # Prevent rope from merging new imports into existing from-import lines.
+    # Without this, MoveGlobal can merge a submodule name into an unrelated
+    # from-import (e.g. `from pkg import existing_symbol, new_module`) instead
+    # of producing `from pkg.new_module import symbol`. Ruff consolidates the
+    # split imports afterward when appropriate.
+    # Note: rope's actions.py reads prefs.get("split_imports") (top-level) but
+    # pyproject.toml populates prefs.imports.split_imports (nested), so we must
+    # set it manually.
+    rope_split = rope_cfg.get("imports", {}).get("split_imports")
+    if rope_split is None:
+        project.prefs.set("split_imports", True)
     ctx = RefactorContext(project=project, args=args, dry_run=dry_run)
 
     if ctx._state_hash:
@@ -657,7 +920,7 @@ def run(
         ctx.undo_all(verbose=True)
         _verify_snapshot(snapshot, "after dry-run undo")
         print()
-        print("To apply, re-run without --diff/--dry-run.")
+        print("To apply, re-run without --diff.")
     else:
         ctx.cleanup_scaffolding(keep_modules=True)
         _print_changes(ctx._diffs, show_diff=False, applied=True)

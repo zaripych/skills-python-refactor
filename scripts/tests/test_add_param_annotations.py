@@ -6,16 +6,36 @@ from argparse import Namespace
 from pathlib import Path
 from textwrap import dedent
 
-from conftest import instantiate_project_from_fixture
+from conftest import instantiate_project_from_fixture, read_directory_structure_sorted
 
 from add_param_annotations import add_param_annotations
 from rope.refactor.importutils.importinfo import FromImport, NormalImport
 from rope_bootstrap import run
 
+FIXTURE_STRUCTURE = [
+    "helper.py",
+    "pyproject.toml",
+    "test_already_annotated.py",
+    "test_async.py",
+    "test_both.py",
+    "test_builtin.py",
+    "test_capsys.py",
+    "test_exclude_me.py",
+    "test_existing_import.py",
+    "test_nested.py",
+    "test_non_matching.py",
+    "test_tmp_path.py",
+    "uv.lock",
+]
+
 
 def test_annotates_capsys(tmp_path: Path) -> None:
     project = instantiate_project_from_fixture("fixture-annotations", tmp_path)
-    assert "import pytest" not in (project / "test_capsys.py").read_text()
+    assert read_directory_structure_sorted(project) == FIXTURE_STRUCTURE
+    assert (project / "test_capsys.py").read_text() == dedent("""\
+        def test_foo(capsys):
+            pass
+    """)
 
     run(
         add_param_annotations(
@@ -24,11 +44,11 @@ def test_annotates_capsys(tmp_path: Path) -> None:
         ),
         args=Namespace(
             project_root=project,
-            dry_run=False,
             diff=False,
         ),
     )
 
+    assert read_directory_structure_sorted(project) == FIXTURE_STRUCTURE
     assert (project / "test_capsys.py").read_text() == dedent("""\
         import pytest
         def test_foo(capsys: pytest.CaptureFixture[str]):
@@ -38,7 +58,11 @@ def test_annotates_capsys(tmp_path: Path) -> None:
 
 def test_annotates_tmp_path(tmp_path: Path) -> None:
     project = instantiate_project_from_fixture("fixture-annotations", tmp_path)
-    assert "from pathlib import Path" not in (project / "test_tmp_path.py").read_text()
+    assert read_directory_structure_sorted(project) == FIXTURE_STRUCTURE
+    assert (project / "test_tmp_path.py").read_text() == dedent("""\
+        def test_foo(tmp_path):
+            pass
+    """)
 
     run(
         add_param_annotations(
@@ -47,11 +71,11 @@ def test_annotates_tmp_path(tmp_path: Path) -> None:
         ),
         args=Namespace(
             project_root=project,
-            dry_run=False,
             diff=False,
         ),
     )
 
+    assert read_directory_structure_sorted(project) == FIXTURE_STRUCTURE
     assert (project / "test_tmp_path.py").read_text() == dedent("""\
         from pathlib import Path
         def test_foo(tmp_path: Path):
@@ -61,7 +85,11 @@ def test_annotates_tmp_path(tmp_path: Path) -> None:
 
 def test_annotates_both_params(tmp_path: Path) -> None:
     project = instantiate_project_from_fixture("fixture-annotations", tmp_path)
-    assert "import pytest" not in (project / "test_both.py").read_text()
+    assert read_directory_structure_sorted(project) == FIXTURE_STRUCTURE
+    assert (project / "test_both.py").read_text() == dedent("""\
+        def test_foo(capsys, tmp_path):
+            pass
+    """)
 
     run(
         add_param_annotations(
@@ -73,21 +101,30 @@ def test_annotates_both_params(tmp_path: Path) -> None:
         ),
         args=Namespace(
             project_root=project,
-            dry_run=False,
             diff=False,
         ),
     )
 
-    content = (project / "test_both.py").read_text()
-    assert "import pytest" in content
-    assert "from pathlib import Path" in content
-    assert (
-        "def test_foo(capsys: pytest.CaptureFixture[str], tmp_path: Path):" in content
-    )
+    assert read_directory_structure_sorted(project) == FIXTURE_STRUCTURE
+    assert (project / "test_both.py").read_text() == dedent("""\
+        import pytest
+        from pathlib import Path
+        def test_foo(capsys: pytest.CaptureFixture[str], tmp_path: Path):
+            pass
+    """)
 
 
 def test_skips_already_annotated(tmp_path: Path) -> None:
     project = instantiate_project_from_fixture("fixture-annotations", tmp_path)
+    assert read_directory_structure_sorted(project) == FIXTURE_STRUCTURE
+    assert (project / "test_already_annotated.py").read_text() == dedent("""\
+        import pytest
+
+
+        def test_foo(capsys: pytest.CaptureFixture[str]):
+            pass
+    """)
+
     run(
         add_param_annotations(
             {"capsys": "pytest.CaptureFixture[str]"},
@@ -95,11 +132,11 @@ def test_skips_already_annotated(tmp_path: Path) -> None:
         ),
         args=Namespace(
             project_root=project,
-            dry_run=False,
             diff=False,
         ),
     )
 
+    assert read_directory_structure_sorted(project) == FIXTURE_STRUCTURE
     assert (project / "test_already_annotated.py").read_text() == dedent("""\
         import pytest
 
@@ -111,7 +148,12 @@ def test_skips_already_annotated(tmp_path: Path) -> None:
 
 def test_skips_non_matching_params(tmp_path: Path) -> None:
     project = instantiate_project_from_fixture("fixture-annotations", tmp_path)
-    before = (project / "test_non_matching.py").read_text()
+    assert read_directory_structure_sorted(project) == FIXTURE_STRUCTURE
+    assert (project / "test_non_matching.py").read_text() == dedent("""\
+        def test_foo(x: int):
+            pass
+    """)
+
     run(
         add_param_annotations(
             {"capsys": "pytest.CaptureFixture[str]", "tmp_path": "Path"},
@@ -122,17 +164,25 @@ def test_skips_non_matching_params(tmp_path: Path) -> None:
         ),
         args=Namespace(
             project_root=project,
-            dry_run=False,
             diff=False,
         ),
     )
 
-    assert (project / "test_non_matching.py").read_text() == before
+    assert read_directory_structure_sorted(project) == FIXTURE_STRUCTURE
+    assert (project / "test_non_matching.py").read_text() == dedent("""\
+        def test_foo(x: int):
+            pass
+    """)
 
 
 def test_handles_nested_functions(tmp_path: Path) -> None:
     project = instantiate_project_from_fixture("fixture-annotations", tmp_path)
-    assert "import pytest" not in (project / "test_nested.py").read_text()
+    assert read_directory_structure_sorted(project) == FIXTURE_STRUCTURE
+    assert (project / "test_nested.py").read_text() == dedent("""\
+        def test_outer(capsys):
+            def inner(tmp_path):
+                pass
+    """)
 
     run(
         add_param_annotations(
@@ -144,21 +194,27 @@ def test_handles_nested_functions(tmp_path: Path) -> None:
         ),
         args=Namespace(
             project_root=project,
-            dry_run=False,
             diff=False,
         ),
     )
 
-    content = (project / "test_nested.py").read_text()
-    assert "import pytest" in content
-    assert "from pathlib import Path" in content
-    assert "def test_outer(capsys: pytest.CaptureFixture[str]):" in content
-    assert "    def inner(tmp_path: Path):" in content
+    assert read_directory_structure_sorted(project) == FIXTURE_STRUCTURE
+    assert (project / "test_nested.py").read_text() == dedent("""\
+        import pytest
+        from pathlib import Path
+        def test_outer(capsys: pytest.CaptureFixture[str]):
+            def inner(tmp_path: Path):
+                pass
+    """)
 
 
 def test_handles_async_functions(tmp_path: Path) -> None:
     project = instantiate_project_from_fixture("fixture-annotations", tmp_path)
-    assert "from pathlib import Path" not in (project / "test_async.py").read_text()
+    assert read_directory_structure_sorted(project) == FIXTURE_STRUCTURE
+    assert (project / "test_async.py").read_text() == dedent("""\
+        async def test_foo(tmp_path):
+            pass
+    """)
 
     run(
         add_param_annotations(
@@ -167,11 +223,11 @@ def test_handles_async_functions(tmp_path: Path) -> None:
         ),
         args=Namespace(
             project_root=project,
-            dry_run=False,
             diff=False,
         ),
     )
 
+    assert read_directory_structure_sorted(project) == FIXTURE_STRUCTURE
     assert (project / "test_async.py").read_text() == dedent("""\
         from pathlib import Path
         async def test_foo(tmp_path: Path):
@@ -181,8 +237,15 @@ def test_handles_async_functions(tmp_path: Path) -> None:
 
 def test_exclude_glob(tmp_path: Path) -> None:
     project = instantiate_project_from_fixture("fixture-annotations", tmp_path)
-    assert "import pytest" not in (project / "test_capsys.py").read_text()
-    before_excluded = (project / "test_exclude_me.py").read_text()
+    assert read_directory_structure_sorted(project) == FIXTURE_STRUCTURE
+    assert (project / "test_capsys.py").read_text() == dedent("""\
+        def test_foo(capsys):
+            pass
+    """)
+    assert (project / "test_exclude_me.py").read_text() == dedent("""\
+        def test_bar(capsys):
+            pass
+    """)
 
     run(
         add_param_annotations(
@@ -192,12 +255,15 @@ def test_exclude_glob(tmp_path: Path) -> None:
         ),
         args=Namespace(
             project_root=project,
-            dry_run=False,
             diff=False,
         ),
     )
 
-    assert (project / "test_exclude_me.py").read_text() == before_excluded
+    assert read_directory_structure_sorted(project) == FIXTURE_STRUCTURE
+    assert (project / "test_exclude_me.py").read_text() == dedent("""\
+        def test_bar(capsys):
+            pass
+    """)
     assert (project / "test_capsys.py").read_text() == dedent("""\
         import pytest
         def test_foo(capsys: pytest.CaptureFixture[str]):
@@ -207,8 +273,15 @@ def test_exclude_glob(tmp_path: Path) -> None:
 
 def test_include_glob(tmp_path: Path) -> None:
     project = instantiate_project_from_fixture("fixture-annotations", tmp_path)
-    assert "import pytest" not in (project / "test_capsys.py").read_text()
-    before_helper = (project / "helper.py").read_text()
+    assert read_directory_structure_sorted(project) == FIXTURE_STRUCTURE
+    assert (project / "test_capsys.py").read_text() == dedent("""\
+        def test_foo(capsys):
+            pass
+    """)
+    assert (project / "helper.py").read_text() == dedent("""\
+        def setup(capsys):
+            pass
+    """)
 
     run(
         add_param_annotations(
@@ -218,12 +291,15 @@ def test_include_glob(tmp_path: Path) -> None:
         ),
         args=Namespace(
             project_root=project,
-            dry_run=False,
             diff=False,
         ),
     )
 
-    assert (project / "helper.py").read_text() == before_helper
+    assert read_directory_structure_sorted(project) == FIXTURE_STRUCTURE
+    assert (project / "helper.py").read_text() == dedent("""\
+        def setup(capsys):
+            pass
+    """)
     assert (project / "test_capsys.py").read_text() == dedent("""\
         import pytest
         def test_foo(capsys: pytest.CaptureFixture[str]):
@@ -233,17 +309,21 @@ def test_include_glob(tmp_path: Path) -> None:
 
 def test_builtin_annotation_no_import(tmp_path: Path) -> None:
     project = instantiate_project_from_fixture("fixture-annotations", tmp_path)
-    assert "name: str" not in (project / "test_builtin.py").read_text()
+    assert read_directory_structure_sorted(project) == FIXTURE_STRUCTURE
+    assert (project / "test_builtin.py").read_text() == dedent("""\
+        def test_foo(name):
+            pass
+    """)
 
     run(
         add_param_annotations({"name": "str"}),
         args=Namespace(
             project_root=project,
-            dry_run=False,
             diff=False,
         ),
     )
 
+    assert read_directory_structure_sorted(project) == FIXTURE_STRUCTURE
     assert (project / "test_builtin.py").read_text() == dedent("""\
         def test_foo(name: str):
             pass
@@ -252,9 +332,14 @@ def test_builtin_annotation_no_import(tmp_path: Path) -> None:
 
 def test_merges_with_existing_from_import(tmp_path: Path) -> None:
     project = instantiate_project_from_fixture("fixture-annotations", tmp_path)
-    content = (project / "test_existing_import.py").read_text()
-    assert "PurePath" in content
-    assert "tmp_path: Path" not in content
+    assert read_directory_structure_sorted(project) == FIXTURE_STRUCTURE
+    assert (project / "test_existing_import.py").read_text() == dedent("""\
+        from pathlib import PurePath
+
+
+        def test_foo(tmp_path):
+            pass
+    """)
 
     run(
         add_param_annotations(
@@ -263,13 +348,16 @@ def test_merges_with_existing_from_import(tmp_path: Path) -> None:
         ),
         args=Namespace(
             project_root=project,
-            dry_run=False,
             diff=False,
         ),
     )
 
-    content = (project / "test_existing_import.py").read_text()
-    assert "def test_foo(tmp_path: Path):" in content
-    assert "from pathlib import Path, PurePath" in content or (
-        "from pathlib import PurePath, Path" in content
-    )
+    assert read_directory_structure_sorted(project) == FIXTURE_STRUCTURE
+    assert (project / "test_existing_import.py").read_text() == dedent("""\
+        from pathlib import PurePath
+        from pathlib import Path
+
+
+        def test_foo(tmp_path: Path):
+            pass
+    """)

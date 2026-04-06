@@ -4,15 +4,80 @@ from __future__ import annotations
 
 from argparse import Namespace
 from pathlib import Path
-from conftest import instantiate_project_from_fixture, snapshot_state
+from textwrap import dedent
+
+from conftest import (
+    instantiate_project_from_fixture,
+    read_directory_structure_sorted,
+    snapshot_state,
+)
 
 import deexport
 from rope_bootstrap import run
+
+FIXTURE_STRUCTURE = [
+    ".gitignore",
+    "cli/__init__.py",
+    "cli/aliased.py",
+    "cli/commands.py",
+    "cli/main.py",
+    "pendant/__init__.py",
+    "pendant/config/__init__.py",
+    "pendant/config/settings.py",
+    "pendant/daemon/__init__.py",
+    "pendant/daemon/handler.py",
+    "pendant/daemon/protocol.py",
+    "pendant/models.py",
+    "pendant/utils.py",
+    "pyproject.toml",
+    "tests/__init__.py",
+    "tests/test_config.py",
+    "tests/test_daemon.py",
+    "tests/test_models.py",
+    "uv.lock",
+]
 
 
 def test_deexport_all(tmp_path: Path) -> None:
     """De-export all symbols from pendant/__init__.py."""
     project = instantiate_project_from_fixture("fixture-deexport", tmp_path)
+
+    assert read_directory_structure_sorted(project) == FIXTURE_STRUCTURE
+
+    assert (project / "pendant/__init__.py").read_text() == dedent("""\
+        from .models import StatusCommand, DeviceInfo
+        from .utils import format_name, parse_address
+    """)
+    assert (project / "cli/main.py").read_text() == dedent("""\
+        from pendant import StatusCommand, DeviceInfo
+        from pendant import format_name
+
+
+        def run():
+            cmd = StatusCommand("device1")
+            info = DeviceInfo(name=format_name("raw name"), address="localhost:8080")
+            return cmd, info
+    """)
+    assert (project / "tests/test_models.py").read_text() == dedent("""\
+        from pendant import StatusCommand, DeviceInfo
+
+
+        def test_status_command():
+            cmd = StatusCommand("test")
+            assert cmd.target == "test"
+
+
+        def test_device_info():
+            info = DeviceInfo(name="dev", address="localhost:80")
+            assert info.name == "dev"
+    """)
+    assert (project / "cli/aliased.py").read_text() == dedent("""\
+        from pendant import StatusCommand as SC
+
+
+        def run():
+            return SC("test")
+    """)
 
     run(
         deexport.refactor,
@@ -20,36 +85,71 @@ def test_deexport_all(tmp_path: Path) -> None:
             project_root=project,
             package_path=project / "pendant",
             symbols=[],
-            dry_run=False,
             diff=False,
         ),
     )
 
-    # __init__.py should be empty (all symbols were re-exports)
-    init_content = (project / "pendant/__init__.py").read_text().strip()
-    assert init_content == "", f"Expected empty __init__.py, got:\n{init_content}"
+    assert read_directory_structure_sorted(project) == FIXTURE_STRUCTURE
 
-    # cli/main.py should import from source modules
-    main_content = (project / "cli/main.py").read_text()
-    assert "from pendant.models import StatusCommand, DeviceInfo" in main_content or (
-        "from pendant.models import" in main_content
-        and "StatusCommand" in main_content
-        and "DeviceInfo" in main_content
-    )
-    assert "from pendant.utils import format_name" in main_content
-    assert "from pendant import" not in main_content
+    assert (project / "pendant/__init__.py").read_text() == ""
 
-    # tests/test_models.py should import from pendant.models
-    test_models = (project / "tests/test_models.py").read_text()
-    assert "from pendant.models import" in test_models
-    assert "StatusCommand" in test_models
-    assert "DeviceInfo" in test_models
-    assert "from pendant import" not in test_models
+    assert (project / "cli/main.py").read_text() == dedent("""\
+        from pendant.models import StatusCommand, DeviceInfo
+        from pendant.utils import format_name
+
+
+        def run():
+            cmd = StatusCommand("device1")
+            info = DeviceInfo(name=format_name("raw name"), address="localhost:8080")
+            return cmd, info
+    """)
+
+    assert (project / "tests/test_models.py").read_text() == dedent("""\
+        from pendant.models import StatusCommand, DeviceInfo
+
+
+        def test_status_command():
+            cmd = StatusCommand("test")
+            assert cmd.target == "test"
+
+
+        def test_device_info():
+            info = DeviceInfo(name="dev", address="localhost:80")
+            assert info.name == "dev"
+    """)
+
+    assert (project / "cli/aliased.py").read_text() == dedent("""\
+        from pendant.models import StatusCommand as SC
+
+
+        def run():
+            return SC("test")
+    """)
 
 
 def test_deexport_specific_symbols(tmp_path: Path) -> None:
     """De-export only StatusCommand, leaving other re-exports intact."""
     project = instantiate_project_from_fixture("fixture-deexport", tmp_path)
+
+    assert read_directory_structure_sorted(project) == FIXTURE_STRUCTURE
+
+    assert (project / "pendant/__init__.py").read_text() == dedent("""\
+        from .models import StatusCommand, DeviceInfo
+        from .utils import format_name, parse_address
+    """)
+    assert (project / "tests/test_models.py").read_text() == dedent("""\
+        from pendant import StatusCommand, DeviceInfo
+
+
+        def test_status_command():
+            cmd = StatusCommand("test")
+            assert cmd.target == "test"
+
+
+        def test_device_info():
+            info = DeviceInfo(name="dev", address="localhost:80")
+            assert info.name == "dev"
+    """)
 
     run(
         deexport.refactor,
@@ -57,90 +157,228 @@ def test_deexport_specific_symbols(tmp_path: Path) -> None:
             project_root=project,
             package_path=project / "pendant",
             symbols=["StatusCommand"],
-            dry_run=False,
             diff=False,
         ),
     )
 
-    # __init__.py should still have DeviceInfo and utils re-exports
-    init_content = (project / "pendant/__init__.py").read_text()
-    assert "DeviceInfo" in init_content
-    assert "format_name" in init_content
-    assert "parse_address" in init_content
-    assert "StatusCommand" not in init_content
+    assert read_directory_structure_sorted(project) == FIXTURE_STRUCTURE
 
-    # tests/test_models.py should have StatusCommand from pendant.models,
-    # but DeviceInfo still from pendant
-    test_models = (project / "tests/test_models.py").read_text()
-    assert "from pendant.models import StatusCommand" in test_models
-    assert "from pendant import DeviceInfo" in test_models
+    assert (project / "pendant/__init__.py").read_text() == dedent("""\
+        from .models import DeviceInfo
+        from .utils import format_name, parse_address
+    """)
+
+    assert (project / "cli/main.py").read_text() == dedent("""\
+        from pendant import DeviceInfo
+        from pendant import format_name
+        from pendant.models import StatusCommand
+
+
+        def run():
+            cmd = StatusCommand("device1")
+            info = DeviceInfo(name=format_name("raw name"), address="localhost:8080")
+            return cmd, info
+    """)
+
+    assert (project / "tests/test_models.py").read_text() == dedent("""\
+        from pendant import DeviceInfo
+        from pendant.models import StatusCommand
+
+
+        def test_status_command():
+            cmd = StatusCommand("test")
+            assert cmd.target == "test"
+
+
+        def test_device_info():
+            info = DeviceInfo(name="dev", address="localhost:80")
+            assert info.name == "dev"
+    """)
+
+    assert (project / "cli/aliased.py").read_text() == dedent("""\
+        from pendant.models import StatusCommand as SC
+
+
+        def run():
+            return SC("test")
+    """)
 
 
 def test_deexport_nested_package(tmp_path: Path) -> None:
     """De-export from pendant/daemon/__init__.py."""
     project = instantiate_project_from_fixture("fixture-deexport", tmp_path)
 
+    assert read_directory_structure_sorted(project) == FIXTURE_STRUCTURE
+
+    assert (project / "pendant/daemon/__init__.py").read_text() == dedent("""\
+        from .protocol import ProtocolHandler, MessageType
+        from .handler import RequestHandler
+
+
+        def build_registry() -> dict[str, ProtocolHandler | RequestHandler]:
+            \"\"\"Uses re-exported names locally.\"\"\"
+            return {
+                MessageType.REQUEST.value: ProtocolHandler(),
+                "handle": RequestHandler(),
+            }
+    """)
+    assert (project / "cli/commands.py").read_text() == dedent("""\
+        from pendant.daemon import ProtocolHandler, RequestHandler, MessageType
+
+
+        def execute():
+            handler = ProtocolHandler()
+            handler.handle(MessageType.REQUEST)
+            req = RequestHandler()
+            return req.process(MessageType.RESPONSE)
+    """)
+    assert (project / "tests/test_daemon.py").read_text() == dedent("""\
+        from pendant.daemon import MessageType, ProtocolHandler
+
+
+        def test_protocol():
+            handler = ProtocolHandler()
+            handler.handle(MessageType.REQUEST)
+    """)
+
     run(
         deexport.refactor,
         args=Namespace(
             project_root=project,
             package_path=project / "pendant/daemon",
             symbols=[],
-            dry_run=False,
             diff=False,
         ),
     )
 
-    # daemon/__init__.py should keep imports used by build_registry()
-    init_content = (project / "pendant/daemon/__init__.py").read_text()
-    assert "def build_registry" in init_content
-    assert "ProtocolHandler" in init_content
-    assert "MessageType" in init_content
-    assert "RequestHandler" in init_content
+    assert read_directory_structure_sorted(project) == FIXTURE_STRUCTURE
 
-    # cli/commands.py should import from source modules directly
-    commands = (project / "cli/commands.py").read_text()
-    assert "from pendant.daemon.protocol import" in commands
-    assert "ProtocolHandler" in commands
-    assert "MessageType" in commands
-    assert "from pendant.daemon.handler import RequestHandler" in commands
+    assert (project / "pendant/daemon/__init__.py").read_text() == dedent("""\
+        from .protocol import ProtocolHandler, MessageType
+        from .handler import RequestHandler
 
-    # tests/test_daemon.py should import from source modules directly
-    test_daemon = (project / "tests/test_daemon.py").read_text()
-    assert "from pendant.daemon.protocol import" in test_daemon
+
+        def build_registry() -> dict[str, ProtocolHandler | RequestHandler]:
+            \"\"\"Uses re-exported names locally.\"\"\"
+            return {
+                MessageType.REQUEST.value: ProtocolHandler(),
+                "handle": RequestHandler(),
+            }
+    """)
+
+    assert (project / "cli/commands.py").read_text() == dedent("""\
+        from pendant.daemon.handler import RequestHandler
+        from pendant.daemon.protocol import ProtocolHandler, MessageType
+
+
+        def execute():
+            handler = ProtocolHandler()
+            handler.handle(MessageType.REQUEST)
+            req = RequestHandler()
+            return req.process(MessageType.RESPONSE)
+    """)
+
+    assert (project / "tests/test_daemon.py").read_text() == dedent("""\
+        from pendant.daemon.protocol import MessageType, ProtocolHandler
+
+
+        def test_protocol():
+            handler = ProtocolHandler()
+            handler.handle(MessageType.REQUEST)
+    """)
 
 
 def test_deexport_keeps_imports_used_locally(tmp_path: Path) -> None:
     """Re-exported names used in __init__.py function bodies stay as imports."""
     project = instantiate_project_from_fixture("fixture-deexport", tmp_path)
 
+    assert read_directory_structure_sorted(project) == FIXTURE_STRUCTURE
+
+    assert (project / "pendant/daemon/__init__.py").read_text() == dedent("""\
+        from .protocol import ProtocolHandler, MessageType
+        from .handler import RequestHandler
+
+
+        def build_registry() -> dict[str, ProtocolHandler | RequestHandler]:
+            \"\"\"Uses re-exported names locally.\"\"\"
+            return {
+                MessageType.REQUEST.value: ProtocolHandler(),
+                "handle": RequestHandler(),
+            }
+    """)
+    assert (project / "cli/commands.py").read_text() == dedent("""\
+        from pendant.daemon import ProtocolHandler, RequestHandler, MessageType
+
+
+        def execute():
+            handler = ProtocolHandler()
+            handler.handle(MessageType.REQUEST)
+            req = RequestHandler()
+            return req.process(MessageType.RESPONSE)
+    """)
+
     run(
         deexport.refactor,
         args=Namespace(
             project_root=project,
             package_path=project / "pendant/daemon",
             symbols=[],
-            dry_run=False,
             diff=False,
         ),
     )
 
-    init_content = (project / "pendant/daemon/__init__.py").read_text()
-    # build_registry() uses all three names -- imports must remain
-    assert "from .protocol import ProtocolHandler, MessageType" in init_content or (
-        "ProtocolHandler" in init_content and "MessageType" in init_content
-    )
-    assert "RequestHandler" in init_content
-    assert "def build_registry" in init_content
+    assert read_directory_structure_sorted(project) == FIXTURE_STRUCTURE
 
-    # But callers should still be rewritten to import directly
-    commands = (project / "cli/commands.py").read_text()
-    assert "from pendant.daemon.protocol import" in commands
+    # daemon/__init__.py unchanged -- all imports used locally by build_registry()
+    assert (project / "pendant/daemon/__init__.py").read_text() == dedent("""\
+        from .protocol import ProtocolHandler, MessageType
+        from .handler import RequestHandler
+
+
+        def build_registry() -> dict[str, ProtocolHandler | RequestHandler]:
+            \"\"\"Uses re-exported names locally.\"\"\"
+            return {
+                MessageType.REQUEST.value: ProtocolHandler(),
+                "handle": RequestHandler(),
+            }
+    """)
+
+    assert (project / "cli/commands.py").read_text() == dedent("""\
+        from pendant.daemon.handler import RequestHandler
+        from pendant.daemon.protocol import ProtocolHandler, MessageType
+
+
+        def execute():
+            handler = ProtocolHandler()
+            handler.handle(MessageType.REQUEST)
+            req = RequestHandler()
+            return req.process(MessageType.RESPONSE)
+    """)
 
 
 def test_deexport_preserves_local_definitions(tmp_path: Path) -> None:
     """De-export from pendant/config/__init__.py preserving CONFIG_VERSION."""
     project = instantiate_project_from_fixture("fixture-deexport", tmp_path)
+
+    assert read_directory_structure_sorted(project) == FIXTURE_STRUCTURE
+
+    assert (project / "pendant/config/__init__.py").read_text() == dedent("""\
+        from .settings import Settings, DEFAULT_PORT
+
+        CONFIG_VERSION = "1.0"
+    """)
+    assert (project / "tests/test_config.py").read_text() == dedent("""\
+        from pendant.config import Settings, DEFAULT_PORT, CONFIG_VERSION
+
+
+        def test_settings():
+            s = Settings()
+            assert s.port == DEFAULT_PORT
+
+
+        def test_config_version():
+            assert CONFIG_VERSION == "1.0"
+    """)
 
     run(
         deexport.refactor,
@@ -148,24 +386,29 @@ def test_deexport_preserves_local_definitions(tmp_path: Path) -> None:
             project_root=project,
             package_path=project / "pendant/config",
             symbols=[],
-            dry_run=False,
             diff=False,
         ),
     )
 
-    # __init__.py should still have CONFIG_VERSION but no re-exports
-    init_content = (project / "pendant/config/__init__.py").read_text()
-    assert 'CONFIG_VERSION = "1.0"' in init_content
-    assert "from .settings import" not in init_content
-    assert "Settings" not in init_content
-    assert "DEFAULT_PORT" not in init_content
+    assert read_directory_structure_sorted(project) == FIXTURE_STRUCTURE
 
-    # tests/test_config.py: Settings and DEFAULT_PORT from settings, CONFIG_VERSION from config
-    test_config = (project / "tests/test_config.py").read_text()
-    assert "from pendant.config.settings import" in test_config
-    assert "Settings" in test_config
-    assert "DEFAULT_PORT" in test_config
-    assert "from pendant.config import CONFIG_VERSION" in test_config
+    assert (project / "pendant/config/__init__.py").read_text() == dedent("""\
+        CONFIG_VERSION = "1.0"
+    """)
+
+    assert (project / "tests/test_config.py").read_text() == dedent("""\
+        from pendant.config import CONFIG_VERSION
+        from pendant.config.settings import Settings, DEFAULT_PORT
+
+
+        def test_settings():
+            s = Settings()
+            assert s.port == DEFAULT_PORT
+
+
+        def test_config_version():
+            assert CONFIG_VERSION == "1.0"
+    """)
 
 
 def test_deexport_dry_run(tmp_path: Path) -> None:
@@ -179,7 +422,6 @@ def test_deexport_dry_run(tmp_path: Path) -> None:
             project_root=project,
             package_path=project / "pendant",
             symbols=[],
-            dry_run=False,
             diff=True,
         ),
     )
@@ -191,17 +433,32 @@ def test_deexport_aliased_imports(tmp_path: Path) -> None:
     """Aliased imports should preserve the alias after rewriting."""
     project = instantiate_project_from_fixture("fixture-deexport", tmp_path)
 
+    assert read_directory_structure_sorted(project) == FIXTURE_STRUCTURE
+
+    assert (project / "cli/aliased.py").read_text() == dedent("""\
+        from pendant import StatusCommand as SC
+
+
+        def run():
+            return SC("test")
+    """)
+
     run(
         deexport.refactor,
         args=Namespace(
             project_root=project,
             package_path=project / "pendant",
             symbols=["StatusCommand"],
-            dry_run=False,
             diff=False,
         ),
     )
 
-    content = (project / "cli/aliased.py").read_text()
-    assert "from pendant.models import StatusCommand as SC" in content
-    assert "from pendant import" not in content
+    assert read_directory_structure_sorted(project) == FIXTURE_STRUCTURE
+
+    assert (project / "cli/aliased.py").read_text() == dedent("""\
+        from pendant.models import StatusCommand as SC
+
+
+        def run():
+            return SC("test")
+    """)

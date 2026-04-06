@@ -26,7 +26,6 @@ def test_adds_import_where_needed(tmp_path: Path) -> None:
         add_import(PYTEST_IMPORT, _uses_pytest),
         args=Namespace(
             project_root=project,
-            dry_run=False,
             diff=False,
         ),
     )

@@ -1,14 +1,13 @@
-"""Undo or redo refactor runs by scanning rope's change history for tagged changesets.
+"""List, undo, or redo refactor runs by scanning rope's change history for tagged changesets.
 
 Usage:
-    uv run python refactor_history.py undo --project-root /path/to/project
-    uv run python refactor_history.py redo --project-root /path/to/project
-    uv run python refactor_history.py undo --hash abc12345
-    uv run python refactor_history.py undo --list
+    uv run python refactor_history.py list
+    uv run python refactor_history.py undo [--hash abc12345]
+    uv run python refactor_history.py redo [--hash abc12345]
 
-Each refactor run tags its changesets with [refactor:<hash>]. By default,
-undo/redo targets the most recent run at the top of the relevant stack.
-Use --hash to target a specific run, or --list to show all runs in history.
+Each refactor run tags its changesets with [refactor:<hash>]. The list command
+shows all runs and prints undo/redo usage. By default, undo/redo targets the
+most recent run at the top of the relevant stack.
 """
 
 from __future__ import annotations
@@ -87,7 +86,9 @@ def apply_by_hash(project: Project, action: str, target_hash: str) -> int:
 def build_parser() -> argparse.ArgumentParser:
     """Build the argument parser for refactor history (undo/redo)."""
     parser = argparse.ArgumentParser(description="Undo or redo a refactor run")
-    parser.add_argument("action", choices=["undo", "redo"], help="Action to perform")
+    parser.add_argument(
+        "action", choices=["list", "undo", "redo"], help="Action to perform"
+    )
     parser.add_argument(
         "--project-root",
         type=Path,
@@ -100,11 +101,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Target a specific refactor hash (default: most recent)",
     )
-    parser.add_argument(
-        "--list",
-        action="store_true",
-        help="List all refactor runs in history",
-    )
     return parser
 
 
@@ -113,25 +109,31 @@ def main(args: argparse.Namespace | None = None) -> None:
         args = build_parser().parse_args()
 
     action = args.action
-    past_tense = "Undone" if action == "undo" else "Redone"
 
     project_root = resolve_project_root(args.project_root)
     project = Project(str(project_root))
 
-    if args.list:
-        runs = list_runs(project, action)
-        if not runs:
-            print(f"No refactor runs found in {action} history.")
-        else:
-            for h, count, descs in runs:
-                print(f"  {h}  ({count} changeset(s))")
-                for d in descs[:3]:
-                    print(f"    {d}")
-                if count > 3:
-                    print(f"    ... and {count - 3} more")
+    if action == "list":
+        for direction in ("undo", "redo"):
+            runs = list_runs(project, direction)
+            print(f"\n{direction.upper()} history:")
+            if not runs:
+                print("  (empty)")
+            else:
+                for h, count, descs in runs:
+                    print(f"  {h}  ({count} changeset(s))")
+                    for d in descs[:3]:
+                        print(f"    {d}")
+                    if count > 3:
+                        print(f"    ... and {count - 3} more")
+        print(
+            "\nTo undo: uv run python scripts/refactor_history.py undo [--hash <hash>]"
+        )
+        print("To redo: uv run python scripts/refactor_history.py redo [--hash <hash>]")
         project.close()
         return
 
+    past_tense = "Undone" if action == "undo" else "Redone"
     target = args.hash
     if target is None:
         target = find_top_hash(project, action)
@@ -143,7 +145,7 @@ def main(args: argparse.Namespace | None = None) -> None:
     count = apply_by_hash(project, action, target)
     if count == 0:
         print(f"No changesets with hash {target} found at top of {action} stack.")
-        print("Use --list to see available runs.")
+        print("Run with 'list' to see available runs.")
     else:
         print(f"{past_tense} {count} changeset(s) for refactor run {target}.")
 

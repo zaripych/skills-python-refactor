@@ -82,7 +82,7 @@ def add_param_annotations(
             # Step 2: Add imports via rope (operates on original source)
             pymodule = ctx.project.get_pymodule(resource)
             module_imports = ModuleImports(ctx.project, pymodule)
-            for param in used_params:
+            for param in sorted(used_params):
                 if param in _imports:
                     module_imports.add_import(_imports[param])
             after_imports = module_imports.get_changed_source()
