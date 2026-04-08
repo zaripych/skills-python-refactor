@@ -1,6 +1,6 @@
 # python-refactor
 
-A Claude Code skill for AST-aware Python refactoring using [python-rope](https://github.com/python-rope/rope). Safer than regex for source code transformation — handles parameter annotations, import management, rename, move, and custom batch edits with precise offset editing.
+A Claude Code skill for AST-aware Python refactoring using [python-rope](https://github.com/python-rope/rope). Safer than regex for source code transformation — rope resolves references and rewrites all callers automatically.
 
 ## Prerequisites
 
@@ -25,37 +25,41 @@ Trigger the skill by asking Claude Code to:
 - **Add type annotations** — `"annotate all cmd parameters with ServerCommandMsg"`
 - **Add/reorganize imports** — `"add import pytest to all test files that use it"`
 - **Rename symbols** — `"rename process_data to handle_event across the project"`
-- **Batch refactors** — `"refactor with rope"` or `"python refactor tool"`
+- **Move modules** — `"move utils.py into the helpers/ package"`
+- **Rename modules** — `"rename parser.py to ast_parser.py"`
+- **Convert module to package** — `"split models.py into a package with submodules"`
+- **Remove re-exports** — `"de-export Device from __init__.py"`
+- **Absolutize imports** — `"convert relative imports to absolute in the api package"`
 
-The skill decides whether to use rope or direct edits based on scope (see the threshold table in SKILL.md).
+The skill decides whether to use rope or direct edits based on scope (see [SKILL.md] for details).
 
-## How it works
+## Included scripts
 
-Refactor scripts are run via `uv run` using a bootstrap (`scripts/rope_bootstrap.py`) that provides:
+Scripts are run via `uv run` using a bootstrap (`scripts/rope_bootstrap.py`) that provides rope project setup, `--diff` mode, history-based undo/redo, and file selection with glob + ripgrep pre-filtering.
 
-- Rope project setup and resource management
-- `--dry-run` and `--diff` modes (always runs dry first)
-- Changes written via rope's history with automatic undo/redo support
-- File selection with glob + text pre-filtering (ripgrep, with grep fallback)
+Each script has a companion `.md` doc with the exact workflow to follow.
 
-## Included tools
+| Script                  | Purpose                                              | Doc                          |
+| ----------------------- | ---------------------------------------------------- | ---------------------------- |
+| `move_module.py`        | Move a module/package to a new directory              | [move_module.md]             |
+| `rename_module.py`      | Rename a module/package in place                      | [rename_module.md]           |
+| `rename_symbol.py`      | Rename a symbol (requires line number — read first)   | [rename_symbol.md]           |
+| `move_globals.py`       | Move top-level symbols between modules                | [move_globals.md]            |
+| `module_to_package.py`  | Convert module to package, split into submodules      | [module_to_package.md]       |
+| `deexport.py`           | Remove re-exports from `__init__.py`                  | [deexport.md]                |
+| `absolutize.py`         | Convert relative imports to absolute                  | [absolutize.md]              |
+| `add_param_annotations` | Batch-annotate function parameters across files       | [add_param_annotations.md]   |
+| `add_imports`           | Add imports to files matching a predicate             | [add_imports.md]             |
+| `refactor_history.py`   | List refactor history, undo/redo                      | —                            |
 
-| Script / Factory         | Purpose                                        |
-| ------------------------ | ---------------------------------------------- |
-| `add_param_annotations`  | Batch-annotate function parameters across files |
-| `add_import`             | Add imports to files matching a predicate       |
-| `move_globals`           | Move top-level symbols between modules          |
-| `move_module`            | Move or rename a module (MoveModule)            |
-| `refactor_history`       | Undo or redo a refactor run by state hash        |
+For cases these don't cover, write a custom script — see [custom_scripts.md].
 
-For cases these don't cover, write a custom script — see `custom_scripts.md`.
+## References
 
-## Skill docs
-
-| File                | Contents                                           |
-| ------------------- | -------------------------------------------------- |
-| `SKILL.md`          | Main skill prompt — decision table, examples       |
-| `custom_scripts.md` | Bootstrap API, script template, RefactorContext     |
-| `annotations.md`    | AST + ChangeCollector pattern for annotations      |
-| `imports.md`        | ModuleImports, NormalImport, FromImport API        |
-| `rope-api.md`       | Full rope API reference (Rename, Move, Extract...) |
+| File                 | Contents                                           |
+| -------------------- | -------------------------------------------------- |
+| [SKILL.md]           | Main skill prompt — decision table, workflows      |
+| [custom_scripts.md]  | Bootstrap API, script template, RefactorContext     |
+| [annotations.md]     | AST + ChangeCollector pattern for annotations      |
+| [imports.md]         | ModuleImports, NormalImport, FromImport API        |
+| [rope-api.md]        | Full rope API reference (Rename, Move, Extract...) |
